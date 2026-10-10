@@ -1,0 +1,145 @@
+# =============================================================================
+# RuoYi-Cloud-Plus —— 就绪信号叠加层（overlay）
+#
+# 用法（叠加在原 compose 之上，不改动上游文件）：
+#   docker compose -f docker-compose.yml -f docker-compose.health.yml up -d
+#   docker compose -f docker-compose.yml -f docker-compose.health.yml ps
+#
+# 为什么用 overlay 而不是改 docker-compose.yml：
+#   1. 上游文件保持原样，git pull上游更新时不会冲突
+#   2. 想退回原始行为，去掉第二个 -f 即可
+#   3. 健康检查/重启策略属于本地运维策略，不是应用配置
+#
+# 各层职责（对应团队规范 §7）：
+#   depends_on   → 启动顺序（依赖已 healthy 才拉起业务服务）
+#   healthcheck  → 容器级健康（进程 + 认证 + 轻量能力）
+#   业务就绪/服务发现 → 由 readiness.sh 负责，不在这里假装完成
+#
+# 注意变量名中的 $$ 是转义，表示把 $ 原样传进容器内由容器 shell 展开。
+# =============================================================================
+services:
+
+  mysql:
+    restart: unless-stopped
+    healthcheck:
+      # 真实验证：完成认证 + 执行轻量查询，而不是只看端口或进程存在
+      test: ["CMD-SHELL", "mysql -uroot -p\"$$MYSQL_ROOT_PASSWORD\" -N -B -e \"SELECT 1\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  redis:
+    restart: unless-stopped
+    healthcheck:
+      # Redis 若配置了 requirepass，裸 PING 会返回 NOAUTH，这里从挂载配置读出口令
+      # 重要：以下每行里的 $$ 都是转义写法，Compose 会把它还原成 $ 再交给容器 shell。
+      # 漏写 $$ 的话 Compose 会在解析阶段就把变量替换成空字符串，脚本静默失效。
+      test:
+        - CMD-SHELL
+        - |
+          conf=""
+          for f in /redis/config/redis.conf /usr/local/etc/redis/redis.conf /etc/redis/redis.conf; do
+            [ -f "$$f" ] && { conf="$$f"; break; }
+          done
+          pass=""
+          if [ -n "$$conf" ]; then
+            pass=$$(tr -d '\r' < "$$conf" | awk '$$1=="requirepass"{print $$2; exit}')
+          fi
+          if [ -n "$$pass" ]; then
+            exec redis-cli -a "$$pass" --no-auth-warning ping
+          else
+            exec redis-cli ping
+          fi
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  nacos:
+    restart: unless-stopped
+    healthcheck:
+      # Nacos 3.x 没有 /actuator/health（实测 404），控制台 health 端点返回 410 Gone。
+      # 这里只做容器级可达性判定；"服务发现真正可用"由 readiness.sh 用命名 API 验证。
+      test:
+        - CMD-SHELL
+        - |
+          if command -v curl >/dev/null 2>&1; then
+            curl -fsS -m 4 http://127.0.0.1:8848/nacos/index.html >/dev/null 2>&1 && exit 0
+          fi
+          (exec 3<>/dev/tcp/127.0.0.1/8848) 2>/dev/null || exit 1
+      interval: 10s
+      timeout: 6s
+      retries: 24
+      start_period: 90s
+
+  # ---------- 业务服务：依赖就绪后再启动，失败自动重启 ----------
+  # 说明：depends_on 的 condition 要求被依赖服务已定义 healthcheck，
+  #       上面 mysql/redis/nacos 均已提供。
+
+  ruoyi-gateway:
+    restart: unless-stopped
+    depends_on:
+      nacos: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  ruoyi-auth:
+    restart: unless-stopped
+    depends_on:
+      nacos: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+
+  ruoyi-system:
+    restart: unless-stopped
+    depends_on:
+      nacos: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+
+  ruoyi-gen:
+    restart: unless-stopped
+    depends_on:
+      nacos: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+
+  ruoyi-job:
+    restart: unless-stopped
+    depends_on:
+      nacos: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+
+  ruoyi-resource:
+    restart: unless-stopped
+    depends_on:
+      nacos: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  ruoyi-workflow:
+    restart: unless-stopped
+    depends_on:
+      nacos: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+
+  ruoyi-ai:
+    restart: unless-stopped
+    depends_on:
+      nacos: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  ruoyi-monitor:
+    restart: unless-stopped
+    depends_on:
+      nacos: { condition: service_healthy }
+
+  ruoyi-snailjob-server:
+    restart: unless-stopped
+    depends_on:
+      nacos: { condition: service_healthy }
+      mysql: { condition: service_healthy }
+
+  ruoyi-snailai-server:
+    restart: unless-stopped
+    depends_on:
+      nacos: { condition: service_healthy }
