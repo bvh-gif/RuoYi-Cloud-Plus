@@ -1,0 +1,4 @@
+
+FROM apache/seata-server:2.6.0
+RUN rm -f /seata-server/libs/nacos-client-1.4.6.jar
+ADD https://repo1.maven.org/maven2/com/alibaba/nacos/nacos-client/2.2.3/nacos-client-2.2.3.jar /seata-server/libs/

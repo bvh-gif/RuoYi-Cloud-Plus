@@ -1,0 +1,33 @@
+=== 已修改（已导出为 patch）===
+warning: in the working copy of 'script/config/nacos/seata-server.properties', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'script/docker/docker-compose.yml', LF will be replaced by CRLF the next time Git touches it
+ pom.xml                                     |  47 +++++++
+ script/config/nacos/application-common.yml  |  28 +++--
+ script/config/nacos/seata-server.properties |  23 ++--
+ script/docker/docker-compose.yml            |  51 +++++---
+ script/docker/redis/conf/redis.conf         |   1 +
+ script/docker/seata/conf/application.yml    | 189 ----------------------------
+ 6 files changed, 116 insertions(+), 223 deletions(-)
+
+=== 未跟踪文件（仅清单，未复制）===
+.envrc
+re.md
+script/config/nacos/nacos.zip
+script/docker/Dockerfile.seata
+script/docker/Makefile
+script/docker/docker-compose-bridge.yml
+script/docker/mysql-schema-from-image.sql
+script/docker/mysql-schema.sql
+script/docker/nacos-mysql.sql
+script/docker/nacos/data/
+script/docker/nacos/logs/
+script/docker/nacos_backup_20260831.sql
+script/docker/redis/data/appendonlydir/
+script/docker/redis/data/dump.rdb
+script/docker/seata-mysql.sql
+script/docker/seata/conf/application_backfile.yml
+script/docker/seata/conf/application_nacos.yml
+script/docker/seata/conf/application_org.yml
+script/docker/seata/libs/
+script/docker/seata/logs/
+seata-mysql.sql

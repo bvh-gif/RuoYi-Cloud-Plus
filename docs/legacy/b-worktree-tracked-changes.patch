@@ -1,0 +1,494 @@
+warning: in the working copy of 'script/config/nacos/seata-server.properties', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'script/docker/docker-compose.yml', LF will be replaced by CRLF the next time Git touches it
+diff --git a/pom.xml b/pom.xml
+index 698fb8dd8..6a72a0db8 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -565,6 +565,28 @@
+     </build>
+ 
+     <repositories>
++        <repository>
++            <id>aliyun</id>
++            <name>Aliyun Maven</name>
++            <url>https://maven.aliyun.com/repository/public</url>
++            <releases>
++                <enabled>true</enabled>
++            </releases>
++            <snapshots>
++                <enabled>false</enabled>
++            </snapshots>
++        </repository>
++        <repository>
++            <id>central</id>
++            <name>Maven Central</name>
++            <url>https://repo1.maven.org/maven2/</url>
++            <releases>
++                <enabled>true</enabled>
++            </releases>
++            <snapshots>
++                <enabled>false</enabled>
++            </snapshots>
++        </repository>
+         <repository>
+             <id>public</id>
+             <name>huawei nexus</name>
+@@ -573,6 +595,31 @@
+                 <enabled>true</enabled>
+             </releases>
+         </repository>
++        <!-- 新增：Spring 官方里程碑仓库，用于解析 spring-ai 系列依赖 -->
++        <repository>
++            <id>spring-milestones</id>
++            <name>Spring Milestones</name>
++            <url>https://repo.spring.io/milestone</url>
++            <releases>
++                <enabled>true</enabled>
++            </releases>
++            <snapshots>
++                <enabled>false</enabled>
++            </snapshots>
++        </repository>
++
++        <!-- 新增：Dromara 社区仓库，用于解析 snail-ai 等依赖 -->
++        <repository>
++            <id>dromara</id>
++            <name>Dromara Repository</name>
++            <url>https://repo.dromara.org/repository/maven-public/</url>
++            <releases>
++                <enabled>true</enabled>
++            </releases>
++            <snapshots>
++                <enabled>false</enabled>
++            </snapshots>
++        </repository>
+     </repositories>
+ 
+     <pluginRepositories>
+diff --git a/script/config/nacos/application-common.yml b/script/config/nacos/application-common.yml
+index f0b241484..5a327b5e9 100644
+--- a/script/config/nacos/application-common.yml
++++ b/script/config/nacos/application-common.yml
+@@ -1,4 +1,4 @@
+-server:
++﻿server:
+   # jetty 配置
+   jetty:
+     # HTTP post内容的最大大小。当值为-1时，默认值为大小是无限的
+@@ -241,7 +241,7 @@ springdoc:
+ # seata配置
+ seata:
+   # 是否启用
+-  enabled: false
++  enabled: true
+   # Seata 应用编号，默认为应用名
+   application-id: ${spring.application.name}
+   # Seata 事务组编号，用于 TC 集群名
+@@ -256,13 +256,19 @@ seata:
+       password: ${spring.cloud.nacos.password}
+       data-id: seata-server.properties
+   registry:
+-    type: nacos
+-    nacos:
+-      application: ruoyi-seata-server
+-      server-addr: ${spring.cloud.nacos.server-addr}
+-      group: ${spring.cloud.nacos.discovery.group}
+-      username: ${spring.cloud.nacos.username}
+-      password: ${spring.cloud.nacos.password}
+-      namespace: public
++    # file registry: 客户端直连 TC (grouplist=127.0.0.1:8091)
++    # nacos registry 不可用: 服务端拒绝回环地址注册, 容器IP对Windows不可达
++    type: file
++  service:
++    # vgroup 映射: 各事务组 -> cluster (file registry 需要, 对应 service.vgroupMapping.*)
++    vgroupMapping:
++      ruoyi-auth-group: default
++      ruoyi-system-group: default
++      ruoyi-resource-group: default
++      ruoyi-workflow-group: default
++    # grouplist: cluster -> TC 地址 (直连 127.0.0.1:8091, 唯一真实可达路径)
++    grouplist:
++      default: 127.0.0.1:8091
+   # 关闭自动代理
+-  enable-auto-data-source-proxy: false
++  enable-auto-data-source-proxy: true
++
+diff --git a/script/config/nacos/seata-server.properties b/script/config/nacos/seata-server.properties
+index 8ad7dade7..4b719b3f4 100644
+--- a/script/config/nacos/seata-server.properties
++++ b/script/config/nacos/seata-server.properties
+@@ -1,15 +1,18 @@
+-service.vgroupMapping.ruoyi-auth-group=default
++﻿service.vgroupMapping.ruoyi-auth-group=default
+ service.vgroupMapping.ruoyi-system-group=default
+ service.vgroupMapping.ruoyi-resource-group=default
+ service.vgroupMapping.ruoyi-workflow-group=default
+ 
++# client file-registry direct connect (bypass nacos discovery)
++service.default.grouplist=127.0.0.1:8091
++service.grouplist.default=127.0.0.1:8091
+ service.enableDegrade=false
+ service.disableGlobalTransaction=false
+ 
+ #Transaction storage configuration, only for the server. The file, DB, and redis configuration values are optional.
+-store.mode=db
+-store.lock.mode=db
+-store.session.mode=db
++store.mode=file
++store.lock.mode=file
++store.session.mode=file
+ #Used for password encryption
+ #store.publicKey=
+ 
+@@ -19,7 +22,7 @@ store.db.dbType=mysql
+ store.db.driverClassName=com.mysql.cj.jdbc.Driver
+ store.db.url=jdbc:mysql://127.0.0.1:3306/ry-seata?useUnicode=true&rewriteBatchedStatements=true&allowPublicKeyRetrieval=true
+ store.db.user=root
+-store.db.password=root
++store.db.password=ruoyi123
+ store.db.minConn=5
+ store.db.maxConn=30
+ store.db.globalTable=global_table
+@@ -29,12 +32,12 @@ store.db.queryLimit=100
+ store.db.lockTable=lock_table
+ store.db.maxWait=5000
+ 
+-# redis 模式 store.mode=redis 开启 (控制台查询功能有限,不影响实际执行功能)
++# redis 妯″紡 store.mode=redis 寮€鍚?(鎺у埗鍙版煡璇㈠姛鑳芥湁闄?涓嶅奖鍝嶅疄闄呮墽琛屽姛鑳?
+ # store.redis.host=127.0.0.1
+ # store.redis.port=6379
+-# 最大连接数
++# 鏈€澶ц繛鎺ユ暟
+ # store.redis.maxConn=10
+-# 最小连接数
++# 鏈€灏忚繛鎺ユ暟
+ # store.redis.minConn=1
+ # store.redis.database=0
+ # store.redis.password=
+@@ -119,3 +122,7 @@ transport.threadFactory.workerThreadSize=default
+ transport.shutdown.wait=3
+ transport.serialization=seata
+ transport.compressor=none
++
++
++
++
+diff --git a/script/docker/docker-compose.yml b/script/docker/docker-compose.yml
+index 4ed4bb312..a52a1670f 100644
+--- a/script/docker/docker-compose.yml
++++ b/script/docker/docker-compose.yml
+@@ -21,11 +21,20 @@ services:
+       --collation-server=utf8mb4_general_ci
+       --explicit_defaults_for_timestamp=true
+       --lower_case_table_names=1
++    healthcheck:
++      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p${MYSQL_ROOT_PASSWORD}"]
++      interval: 10s
++      timeout: 5s
++      retries: 10
++      start_period: 30s
+     privileged: true
+-    network_mode: "host"
++    restart: unless-stopped
++    # network_mode: "host"
++    
+ 
+   nacos:
+-    image: nacos/nacos-server:v3.2.3
++    # image: nacos/nacos-server:v3.2.3
++    image: nacos/nacos-server:v3.1.2
+     container_name: nacos
+     ports:
+       - "8848:8848"
+@@ -35,6 +44,10 @@ services:
+     environment:
+       TZ: Asia/Shanghai
+       MODE: standalone
++      MYSQL_SERVICE_HOST: mysql
++      MYSQL_SERVICE_DB_NAME: nacos
++      MYSQL_SERVICE_USER: root
++      MYSQL_SERVICE_PASSWORD: ruoyi123
+       PREFER_HOST_MODE: hostname
+       JVM_XMS: 256m
+       JVM_XMX: 512m
+@@ -43,10 +56,15 @@ services:
+       NACOS_AUTH_IDENTITY_KEY: ruoyi-vue-plus-key
+       NACOS_AUTH_IDENTITY_VALUE: ruoyi-vue-plus-value
+     volumes:
+-      - /docker/nacos/logs/:/home/nacos/logs
++      - ./nacos/logs/:/home/nacos/logs
++      - ./nacos/data:/home/nacos/data 
+       # 默认单机模式 使用 mysql 等按 nacos 文档在配置文件内修改 所有配置均可在配置文件修改
+-      - /docker/nacos/conf/application.properties:/home/nacos/conf/application.properties
+-    network_mode: "host"
++      # - ./nacos/conf/application.properties:/home/nacos/conf/application.properties
++    depends_on:
++      mysql:
++        condition: service_healthy
++    restart: unless-stopped
++    # network_mode: "host"
+ 
+   redis:
+     image: redis:8.6.3
+@@ -58,12 +76,13 @@ services:
+       TZ: Asia/Shanghai
+     volumes:
+       # 配置文件
+-      - /docker/redis/conf:/redis/config
++      - ./redis/conf:/redis/config
+       # 数据文件
+-      - /docker/redis/data/:/redis/data/
++      - ./redis/data/:/redis/data/
+     command: "redis-server /redis/config/redis.conf"
+     privileged: true
+-    network_mode: "host"
++    restart: unless-stopped
++    # network_mode: "host"
+ 
+   minio:
+     # pgsty 开源社区 fork 重新维护的最新版 minio
+@@ -101,21 +120,23 @@ services:
+ 
+   seata-server:
+     image: apache/seata-server:2.6.0
++    # image: my-seata:2.6.0-fixed
+     container_name: seata-server
+     ports:
+       - "7091:7091"
+       - "8091:8091"
+     environment:
+       TZ: Asia/Shanghai
+-      # 注意 此处ip如果是外网使用 要改为外网ip
+-      # SEATA_IP: 127.0.0.1
++# force register IP via SEATA_IP env (read by ContainerHelper.getHost -> ParameterParser -> registry)
++      # 127.0.0.1 is reachable from Windows host via Docker Desktop port mapping (proven by tcp6 ESTABLISHED)
++      # host.docker.internal(=192.168.65.254) failed: clients on Windows get false-positive from Mihomo TUN
++      SEATA_IP: 127.0.0.1
+       SEATA_PORT: 8091
+     volumes:
+-      - /docker/seata/conf/application.yml:/seata-server/resources/application.yml
+-      - /docker/seata/logs/:/root/logs/seata
++      - ./seata/conf/application_nacos.yml:/seata-server/resources/application.yml
++      - ./seata/logs/:/root/logs/seata
+     privileged: true
+-    network_mode: "host"
+-
++    # network_mode: "host"
+   nginx-web:
+     image: nginx:1.31.1
+     container_name: nginx-web
+@@ -362,7 +383,7 @@ services:
+       I18N_LOCALE: zh-CN
+       # 访问域名
+       # SERVER_PUBLICBASEURL: https://kibana.cloud.com
+-    volumes:
++    volumes:        
+       - /docker/elk/kibana/config/kibana.yml:/usr/share/kibana/config/kibana.yml
+     network_mode: "host"
+ 
+diff --git a/script/docker/redis/conf/redis.conf b/script/docker/redis/conf/redis.conf
+index 72255c617..4e5cd74f8 100644
+--- a/script/docker/redis/conf/redis.conf
++++ b/script/docker/redis/conf/redis.conf
+@@ -1,5 +1,6 @@
+ # redis 密码
+ requirepass ruoyi123
++bind 0.0.0.0
+ 
+ # key 监听器配置
+ # notify-keyspace-events Ex
+diff --git a/script/docker/seata/conf/application.yml b/script/docker/seata/conf/application.yml
+deleted file mode 100644
+index c21c939f2..000000000
+--- a/script/docker/seata/conf/application.yml
++++ /dev/null
+@@ -1,189 +0,0 @@
+-#
+-# Licensed to the Apache Software Foundation (ASF) under one or more
+-# contributor license agreements.  See the NOTICE file distributed with
+-# this work for additional information regarding copyright ownership.
+-# The ASF licenses this file to You under the Apache License, Version 2.0
+-# (the "License"); you may not use this file except in compliance with
+-# the License.  You may obtain a copy of the License at
+-#
+-#     http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-#
+-server:
+-  port: 8091
+-spring:
+-  application:
+-    name: seata-server
+-  main:
+-    web-application-type: none
+-logging:
+-  config: classpath:logback-spring.xml
+-  file:
+-    path: ${log.home:${user.home}/logs/seata}
+-  extend:
+-    logstash-appender:
+-      # off by default
+-      enabled: false
+-      destination: 127.0.0.1:4560
+-    kafka-appender:
+-      # off by default
+-      enabled: false
+-      bootstrap-servers: 127.0.0.1:9092
+-      topic: logback_to_logstash
+-      producer:
+-        acks: 0
+-        linger-ms: 1000
+-        max-block-ms: 0
+-    metric-appender:
+-      # off by default
+-      enabled: false
+-seata:
+-  config:
+-    # support: nacos 、 consul 、 apollo 、 zk  、 etcd3
+-    type: file
+-    nacos:
+-      server-addr: 127.0.0.1:8848
+-      namespace: public
+-      group: DEFAULT_GROUP
+-      context-path:
+-      ##1.The following configuration is for the open source version of Nacos
+-      username: nacos
+-      password: nacos
+-      ##2.The following configuration is for the MSE Nacos on aliyun
+-      #access-key:
+-      #secret-key:
+-      ##3.The following configuration is used to deploy on Aliyun ECS or ACK without authentication
+-      #ram-role-name:
+-      data-id: seata-server.properties
+-  registry:
+-    # support: nacos 、 eureka 、 redis 、 zk  、 consul 、 etcd3 、 sofa 、 seata
+-    type: file
+-    # preferred-networks: 30.240.*
+-    metadata:
+-      weight: 100
+-    nacos:
+-      application: seata-server
+-      server-addr: 127.0.0.1:8848
+-      group: DEFAULT_GROUP
+-      namespace: public
+-      cluster: default
+-      context-path:
+-      ##1.The following configuration is for the open source version of Nacos
+-      username: nacos
+-      password: nacos
+-      ##2.The following configuration is for the MSE Nacos on aliyun
+-      #access-key:
+-      #secret-key:
+-      ##3.The following configuration is used to deploy on Aliyun ECS or ACK without authentication
+-      #ram-role-name:
+-
+-  server:
+-    service-port: 8091 # If not configured, the default is '${server.port}'
+-    max-commit-retry-timeout: -1
+-    max-rollback-retry-timeout: -1
+-    rollback-failed-unlock-enable: false
+-    enable-check-auth: true
+-    enable-parallel-request-handle: true
+-    enable-parallel-handle-branch: false
+-    retry-dead-threshold: 70000
+-    xaer-nota-retry-timeout: 60000
+-    enableParallelRequestHandle: true
+-    applicationDataLimitCheck: true
+-    applicationDataLimit: 64000
+-    recovery:
+-      committing-retry-period: 1000
+-      async-committing-retry-period: 1000
+-      rollbacking-retry-period: 1000
+-      end-status-retry-period: 1000
+-      timeout-retry-period: 1000
+-    undo:
+-      log-save-days: 7
+-      log-delete-period: 86400000
+-    session:
+-      branch-async-queue-size: 5000 #branch async remove queue size
+-      enable-branch-async-remove: false #enable to asynchronous remove branchSession
+-    ratelimit:
+-      enable: false
+-      bucketTokenNumPerSecond: 999999
+-      bucketTokenMaxNum: 999999
+-      bucketTokenInitialNum: 999999
+-    http:
+-      filter:
+-        xss:
+-          keywords: ["<script>", "</script>", "javascript:", "vbscript:"]
+-  store:
+-    # support: file 、 db 、 redis 、 raft
+-    mode: file
+-    session:
+-      mode: file
+-    lock:
+-      mode: file
+-    file:
+-      dir: sessionStore
+-      max-branch-session-size: 16384
+-      max-global-session-size: 512
+-      file-write-buffer-cache-size: 16384
+-      session-reload-read-size: 100
+-      flush-disk-mode: async
+-    db:
+-      datasource: hikari
+-      db-type: mysql
+-      driver-class-name: com.mysql.jdbc.Driver
+-      url: jdbc:mysql://127.0.0.1:3306/seata?rewriteBatchedStatements=true
+-      user: root
+-      password: root
+-      min-conn: 10
+-      max-conn: 100
+-      global-table: global_table
+-      branch-table: branch_table
+-      lock-table: lock_table
+-      distributed-lock-table: distributed_lock
+-      vgroup-table: vgroup_table
+-      query-limit: 1000
+-      max-wait: 5000
+-      hikari:
+-        idle-timeout: 600000
+-        keepalive-time: 120000
+-        max-lifetime: 1800000
+-        validation-timeout: 5000
+-    redis:
+-      mode: single
+-      # support: lua 、 pipeline
+-      type: lua
+-      database: 0
+-      min-conn: 10
+-      max-conn: 100
+-      password:
+-      max-total: 100
+-      query-limit: 1000
+-      single:
+-        host: 127.0.0.1
+-        port: 6379
+-      sentinel:
+-        master-name:
+-        sentinel-hosts:
+-        sentinel-password:
+-  metrics:
+-    enabled: false
+-    registry-type: compact
+-    exporter-list: prometheus
+-    exporter-prometheus-port: 9898
+-  transport:
+-    rpc-tc-request-timeout: 15000
+-    enable-tc-server-batch-send-response: false
+-    # HTTP thread pool
+-    min-http-pool-size: 10
+-    max-http-pool-size: 100
+-    max-http-task-queue-size: 1000
+-    http-pool-keep-alive-time: 500
+-    shutdown:
+-      wait: 3
+-    thread-factory:
+-      boss-thread-prefix: NettyBoss
+-      worker-thread-prefix: NettyServerNIOWorker
+-      boss-thread-size: 1
