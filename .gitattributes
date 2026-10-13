@@ -1,2 +1,11 @@
 /mvnw text eol=lf
 *.cmd text eol=crlf
+
+# 以下文件在 WSL / Linux 下会被执行或被解析器读取，必须保持 LF。
+# 仓库 core.autocrlf=true 会让它们在 Windows 检出时变成 CRLF：
+# shell 脚本报 "bad interpreter: /bin/bash^M"，Makefile recipe 尾部带 \r 也会出错。
+*.sh     text eol=lf
+Makefile text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.env    text eol=lf
