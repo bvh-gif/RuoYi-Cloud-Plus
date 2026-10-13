@@ -40,9 +40,20 @@ nbdist/
 *.log.gz
 *.xml.versionsBackup
 *.swp
+*.bak
 
 !*/build/*.java
 !*/build/*.html
 !*/build/*.xml
 
 .flattened-pom.xml
+
+######################################################################
+# Local runtime data & tooling
+# .local-data holds MySQL InnoDB files (~219M), Nacos/Redis dumps — never commit
+
+.local-data/
+.workbuddy/
+
+# 每日工作记录：个人/本地产物，不作为团队交付物提交
+docs/daily/
