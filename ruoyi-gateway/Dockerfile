@@ -15,7 +15,7 @@ ENV SERVER_PORT=8080 LANG=C.UTF-8 LC_ALL=C.UTF-8 JAVA_OPTS=""
 
 EXPOSE ${SERVER_PORT}
 
-ADD ./target/ruoyi-gateway-mvc.jar ./app.jar
+ADD ./target/ruoyi-gateway.jar ./app.jar
 
 SHELL ["/bin/bash", "-c"]
 
