@@ -1,0 +1,87 @@
+# docker-compose.mem.yml —— JVM 堆上限叠加层
+#
+# ── 解决什么问题 ────────────────────────────────────────────────────
+# 业务镜像的 Dockerfile 里 `ENV JAVA_OPTS=""` 是空的，
+# 而 JVM 默认最大堆 = 容器可见物理内存的 1/4（本机约 3.8GB）。
+# 11 个业务服务同时运行会吃到 13GB+，直接把 Docker（上限 15.35GiB）撑爆——
+# 实测表现是 **Nacos 被 OOM 重启**、守护进程间歇性返回 HTTP 500。
+#
+# 本层通过 JAVA_OPTS 注入 -Xmx，把每个服务的堆钉死。
+# 注意：Dockerfile 的 ENTRYPOINT 是 `${JAVA_OPTS} -jar app.jar`，
+# 所以这里设的 JAVA_OPTS 会覆盖镜像里的空默认值。
+#
+# ── 怎么调 ──────────────────────────────────────────────────────────
+# 两个变量都可在 shell 或 .env 中覆盖，不必改本文件：
+#
+#   RUOYI_JVM_XMX        默认 768m  —— 8 个轻量服务
+#   RUOYI_JVM_XMX_HEAVY  默认 1g    —— system / workflow / ai 三个重量服务
+#
+# 例（低资源可行性验证，见 script/minimal.sh）：
+#   RUOYI_JVM_XMX=512m RUOYI_JVM_XMX_HEAVY=640m docker compose ... up -d
+#
+# ── 怎么用 ──────────────────────────────────────────────────────────
+# 文件顺序即优先级，后出现者覆盖先出现者：
+#
+#   docker compose \
+#     -f docker-compose.yml \
+#     -f docker-compose.health.yml \
+#     -f docker-compose.local.yml \
+#     -f docker-compose.mem.yml \
+#     up -d <服务名...>
+#
+# ── 内存账本 ────────────────────────────────────────────────────────
+#   全量（默认 768m / 1g）：11 个服务 ≈ 10.6GB + 基础设施 1.5GB ≈ 12.1GB
+#   最小（512m / 640m）  ： 3 个服务 ≈  2.1GB + 基础设施 1.5GB ≈  3.6GB
+#
+# 实测 512m 下 gateway / auth / system 可正常启动并完成注册。
+# 若某服务在 512m 下报 OutOfMemoryError，把对应变量调回 768m 即可。
+
+services:
+
+  ruoyi-gateway:
+    environment:
+      JAVA_OPTS: "-Xms128m -Xmx${RUOYI_JVM_XMX:-768m} -XX:MaxMetaspaceSize=256m"
+
+  ruoyi-auth:
+    environment:
+      JAVA_OPTS: "-Xms128m -Xmx${RUOYI_JVM_XMX:-768m} -XX:MaxMetaspaceSize=256m"
+
+  ruoyi-gen:
+    environment:
+      JAVA_OPTS: "-Xms128m -Xmx${RUOYI_JVM_XMX:-768m} -XX:MaxMetaspaceSize=256m"
+
+  ruoyi-job:
+    environment:
+      JAVA_OPTS: "-Xms128m -Xmx${RUOYI_JVM_XMX:-768m} -XX:MaxMetaspaceSize=256m"
+
+  ruoyi-resource:
+    environment:
+      JAVA_OPTS: "-Xms128m -Xmx${RUOYI_JVM_XMX:-768m} -XX:MaxMetaspaceSize=256m"
+
+  ruoyi-monitor:
+    environment:
+      JAVA_OPTS: "-Xms128m -Xmx${RUOYI_JVM_XMX:-768m} -XX:MaxMetaspaceSize=256m"
+
+  ruoyi-snailjob-server:
+    environment:
+      JAVA_OPTS: "-Xms128m -Xmx${RUOYI_JVM_XMX:-768m} -XX:MaxMetaspaceSize=256m"
+
+  ruoyi-snailai-server:
+    environment:
+      JAVA_OPTS: "-Xms128m -Xmx${RUOYI_JVM_XMX:-768m} -XX:MaxMetaspaceSize=256m"
+
+  # ── 以下三个更吃内存，默认给到 1g ────────────────────────────────
+  # system：全站最核心，Dubbo 服务 + 缓存最重（无限制时实测涨到 3GB）
+  ruoyi-system:
+    environment:
+      JAVA_OPTS: "-Xms128m -Xmx${RUOYI_JVM_XMX_HEAVY:-1g} -XX:MaxMetaspaceSize=256m"
+
+  # workflow：warm-flow 流程引擎 + liteflow 规则引擎
+  ruoyi-workflow:
+    environment:
+      JAVA_OPTS: "-Xms128m -Xmx${RUOYI_JVM_XMX_HEAVY:-1g} -XX:MaxMetaspaceSize=256m"
+
+  # ai：Snail AI 客户端 + MCP + 技能加载
+  ruoyi-ai:
+    environment:
+      JAVA_OPTS: "-Xms128m -Xmx${RUOYI_JVM_XMX_HEAVY:-1g} -XX:MaxMetaspaceSize=256m"
