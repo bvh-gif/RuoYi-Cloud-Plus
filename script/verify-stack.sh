@@ -26,7 +26,11 @@ DB_PASS="${DB_PASS:-ruoyi123}"
 EXPECT_IMAGES=11
 EXPECT_DBS="ry-cloud ry-job ry-ai ry-workflow"
 EXPECT_CONFIGS=14
-EXPECT_SERVICES="ruoyi-gateway ruoyi-auth ruoyi-system"
+# 可用环境变量覆盖，做低资源验证时只需验最小集：
+#   RUOYI_VERIFY_SERVICES="ruoyi-gateway ruoyi-auth ruoyi-system" ./script/verify-stack.sh
+EXPECT_SERVICES="${RUOYI_VERIFY_SERVICES:-ruoyi-gateway ruoyi-auth ruoyi-system \
+ruoyi-gen ruoyi-job ruoyi-resource ruoyi-workflow ruoyi-ai ruoyi-monitor \
+ruoyi-snailjob-server ruoyi-snailai-server}"
 
 PASS=0
 FAIL=0
@@ -122,13 +126,24 @@ echo
 echo "════════════════════════════════════════════════"
 echo " 5. 端到端调用（从容器内打网关）"
 echo "════════════════════════════════════════════════"
+# 注意：/code 的 HTTP 状态码恒为 200，但 body 里才是真实业务码
+# （未带 token 时 body = {"code":401,"msg":"未能读取到有效 token"}）。
+# 只查 HTTP 码会永远 PASS，必须同时校验响应体是结构化 JSON。
+gw_body=$(docker exec "$NACOS_CONTAINER" curl -s --max-time 15 "http://127.0.0.1:8080/code")
 gw_code=$(docker exec "$NACOS_CONTAINER" curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
           "http://127.0.0.1:8080/code")
-if [ "$gw_code" = "200" ]; then
-  pass "GET /code → HTTP 200"
+if [ "$gw_code" = "200" ] && printf '%s' "$gw_body" | grep -q '"code"'; then
+  pass "GET /code → HTTP 200 且返回结构化响应"
+  printf '       响应：%s\n' "$(printf '%s' "$gw_body" | head -c 120)"
 else
-  fail "GET /code → HTTP $gw_code"
+  fail "GET /code → HTTP $gw_code，响应：$(printf '%s' "$gw_body" | head -c 120)"
 fi
+# 这里故意只传 username/password：
+# api-decrypt.enabled=true（上游默认）时，/auth/login 带 @ApiEncrypt，
+# 明文请求体会被 CryptoFilter 丢弃，auth 拿到空 body → 返回
+# {"code":500,"msg":"认证客户端id不能为空"}。
+# 拿到这条响应 = 请求确实穿透到了 auth 的业务校验层，链路是通的。
+# 想做真实登录需先关掉 api-decrypt 与验证码，并按协议加密请求体。
 r=$(docker exec "$NACOS_CONTAINER" curl -s --max-time 15 -X POST "http://127.0.0.1:8080/auth/login" \
     -H "Content-Type: application/json" -d '{"username":"admin","password":"admin123"}')
 if printf '%s' "$r" | grep -q '"code"'; then
