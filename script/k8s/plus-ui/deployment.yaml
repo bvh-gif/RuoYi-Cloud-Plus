@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: plus-ui
+  # 必须与后端 Service（ruoyi-gateway / ruoyi-snailai-server）同一命名空间，
+  # 这样 nginx.conf 里写的短名字 ruoyi-gateway 才能被 CoreDNS 解析。
+  # 跨命名空间要改成 ruoyi-gateway.<ns>.svc.cluster.local。
+  namespace: ruoyi
+  labels:
+    app: plus-ui
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: plus-ui
+  template:
+    metadata:
+      labels:
+        app: plus-ui
+    spec:
+      containers:
+        - name: plus-ui
+          # 本地名 ruoyi/plus-ui:6.0.0；远端仓库由流水线 sed 加前缀（如 ghcr.io/owner/ruoyi/plus-ui:6.0.0）
+          image: ruoyi/plus-ui:6.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+          # SPA 静态页，探针打根路径即可（不是后端健康检查）
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+# 说明：nginx 默认监听特权端口 80，容器内 master 进程以 root 启动、worker 降权为 nginx，
+# 这是单用途容器的常见做法。若要更严格的非 root 化，可改 nginx.conf 监听 8080、
+# 这里 targetPort 也改 8080，并加 securityContext.runAsNonRoot: true。

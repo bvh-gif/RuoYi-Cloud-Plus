@@ -1,0 +1,85 @@
+# ============================================================
+# mysql —— 业务库（system / auth / gen 等依赖）
+# ------------------------------------------------------------
+# root 密码 ruoyi123，与项目约定一致。
+# 初始化 SQL 来自仓库 script/sql/ 的 4 个文件（ry-cloud / ry-job / ry-ai / ry-workflow），
+# 由流水线用 `kubectl create configmap mysql-init-sql --from-file=script/sql/...` 生成后挂到
+# /docker-entrypoint-initdb.d（MySQL 首次启动自动执行 *.sql，建库建表）。
+# 数据卷用 emptyDir（测试非持久化）；生产务必换成 PVC。
+# Service 名 mysql:3306，对应应用 Nacos 配置里的 host: mysql。
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql
+  namespace: ruoyi
+  labels:
+    app: mysql
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: mysql
+              containerPort: 3306
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              value: "ruoyi123"
+            - name: TZ
+              value: Asia/Shanghai
+          volumeMounts:
+            - name: init-sql
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/mysql
+          readinessProbe:
+            tcpSocket:
+              port: 3306
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 3306
+            initialDelaySeconds: 40
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: init-sql
+          configMap:
+            name: mysql-init-sql
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: ruoyi
+  labels:
+    app: mysql
+spec:
+  type: ClusterIP
+  selector:
+    app: mysql
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: 3306
+      protocol: TCP

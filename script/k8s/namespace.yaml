@@ -1,0 +1,8 @@
+# 统一命名空间：所有后端 Service、plus-ui、中间件都在 ruoyi 内，
+# 这样 CoreDNS 能把短名字（nacos / mysql / redis / ruoyi-gateway ...）解析通。
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ruoyi
+  labels:
+    app.kubernetes.io/part-of: ruoyi-cloud-plus

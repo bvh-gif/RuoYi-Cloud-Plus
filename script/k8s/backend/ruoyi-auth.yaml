@@ -1,0 +1,67 @@
+# ruoyi-auth —— 认证服务（网关 → auth → system 链的关键一环）
+# 前置依赖：同命名空间需有 nacos:8848。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ruoyi-auth
+  namespace: ruoyi
+  labels:
+    app: ruoyi-auth
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ruoyi-auth
+  template:
+    metadata:
+      labels:
+        app: ruoyi-auth
+    spec:
+      containers:
+        - name: ruoyi-auth
+          image: ruoyi/ruoyi-auth:6.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 9210
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+            - name: SPRING_CLOUD_NACOS_SERVER_ADDR
+              value: nacos:8848
+            - name: JAVA_OPTS
+              value: "-XX:MaxRAMPercentage=75.0 -Duser.timezone=Asia/Shanghai"
+          readinessProbe:
+            tcpSocket:
+              port: 9210
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 9210
+            initialDelaySeconds: 60
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ruoyi-auth
+  namespace: ruoyi
+  labels:
+    app: ruoyi-auth
+spec:
+  type: ClusterIP
+  selector:
+    app: ruoyi-auth
+  ports:
+    - name: http
+      port: 9210
+      targetPort: 9210
+      protocol: TCP

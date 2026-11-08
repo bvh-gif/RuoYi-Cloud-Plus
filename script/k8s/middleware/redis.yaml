@@ -1,0 +1,66 @@
+# ============================================================
+# redis —— 缓存（auth / system 等依赖）
+# ------------------------------------------------------------
+# requirepass ruoyi123，与项目约定及 Nacos 配置里的 redis 密码一致。
+# Service 名 redis:6379，对应应用 Nacos 配置里的 host: redis。
+# 数据卷用 emptyDir（测试非持久化）；生产换成 PVC / 哨兵 / 集群。
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: ruoyi
+  labels:
+    app: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: redis
+              containerPort: 6379
+          command: ["redis-server", "--requirepass", "ruoyi123"]
+          readinessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: ruoyi
+  labels:
+    app: redis
+spec:
+  type: ClusterIP
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+      protocol: TCP

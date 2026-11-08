@@ -1,0 +1,109 @@
+# build-and-image.yml —— 标准 GitHub Actions 格式
+#
+# 目的：只把代码「编译 → 构建 11 个业务镜像」这一步跑通并验证，不做 Nexus 上传/交付、不起栈冒烟。
+# 与同目录 ci.yml 的区别：ci.yml 只冒烟 3 个镜像 + 起整套栈；本文件构建全部 11 个镜像后停止。
+#
+# 架构：目标镜像为 linux/arm64。在 x86 runner（GitHub 默认 ubuntu-latest）上靠 buildx + QEMU 跨架构构建；
+#         若 runner 本身是 arm64（如贵司 Gitea 的 ubuntu-latest 标签机器），QEMU 用不上但无害。
+#         （后端 Dockerfile 含 `RUN mkdir`，跨架构构建需要 QEMU 模拟，不能省。）
+#
+# 运行：
+#   - GitHub：推到仓库后 → Actions → 选本工作流 → Run workflow（或 push/pull_request 自动触发）。
+#   - 本地：在装了 Docker 的机器上用 `act -W .github/workflows/build-and-image.yml` 跑（需联网拉 actions/JDK）。
+#   - 贵司 Gitea：把每个 `uses:` 的 `actions/...` 前缀改成内部代理 `http://32.61.79.150:30003/actions/...`
+#     （与 .gitea/workflows/back.yml 一致），其余逻辑不变；Maven 依赖与基础镜像走离线仓库/预置。
+
+name: build-and-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "镜像版本标签（须与 pom <revision> / docker-compose 一致）"
+        required: false
+        default: "6.0.0"
+      platform:
+        description: "目标架构：linux/arm64（生产，x86 上需 QEMU 较慢）或 linux/amd64（x86 原生免 QEMU，仅测试用）"
+        required: false
+        default: "linux/arm64"
+  push:
+    branches: ["6.X", "docs/project-progress"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TAG: "6.0.0"            # 须与 docker-compose.yml / 根 pom <revision> 一致
+  JAVA_VERSION: "21"
+
+jobs:
+  build-images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: "检出代码"
+        uses: actions/checkout@v4
+
+      - name: "Set up JDK 21（Liberica，与 bellsoft 运行时同源）"
+        uses: actions/setup-java@v4
+        with:
+          distribution: "liberica"
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: "maven"
+
+      - name: "Maven 编译（整仓 reactor，跳过测试 → 产出 49 个 jar）"
+        env:
+          MAVEN_OPTS: "-Xmx2g"
+        run: |
+          chmod +x ./mvnw
+          ./mvnw -B -ntp clean install -DskipTests
+
+      - name: "Set up QEMU（跨架构构建 arm64；原生 arm64 runner 可省略但无害）"
+        uses: docker/setup-qemu-action@v3
+
+      - name: "Set up Docker Buildx"
+        uses: docker/setup-buildx-action@v3
+
+      - name: "构建 11 个业务镜像（--platform 可选，--load 载入本地 daemon）"
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || env.TAG }}"
+          PLATFORM="${{ github.event.inputs.platform || 'linux/arm64' }}"
+          # 模块目录 -> 镜像名（取自 script/build-images.sh 的 MODULES，已逐目录核实 Dockerfile 存在）
+          # 注意：compose 虽引用 ruoyi/ruoyi-demo，但 MODULES 不含它，本流水线永不产出。
+          MODULES=(
+            "ruoyi-gateway:ruoyi/ruoyi-gateway"
+            "ruoyi-auth:ruoyi/ruoyi-auth"
+            "ruoyi-modules/ruoyi-system:ruoyi/ruoyi-system"
+            "ruoyi-modules/ruoyi-gen:ruoyi/ruoyi-gen"
+            "ruoyi-modules/ruoyi-job:ruoyi/ruoyi-job"
+            "ruoyi-modules/ruoyi-resource:ruoyi/ruoyi-resource"
+            "ruoyi-modules/ruoyi-workflow:ruoyi/ruoyi-workflow"
+            "ruoyi-modules/ruoyi-ai:ruoyi/ruoyi-ai"
+            "ruoyi-visual/ruoyi-monitor:ruoyi/ruoyi-monitor"
+            "ruoyi-visual/ruoyi-snailjob-server:ruoyi/ruoyi-snailjob-server"
+            "ruoyi-visual/ruoyi-snailai-server:ruoyi/ruoyi-snailai-server"
+          )
+          fail=0
+          for entry in "${MODULES[@]}"; do
+            dir="${entry%%:*}"
+            image="${entry##*:}"
+            echo "=============================================================="
+            echo "build $image:$TAG  <- $dir"
+            echo "=============================================================="
+            if docker buildx build --platform "$PLATFORM" --load -t "$image:$TAG" "./$dir"; then
+              echo "OK   $image:$TAG"
+            else
+              echo "FAIL $image"
+              fail=$((fail + 1))
+            fi
+          done
+
+      - name: "列出产物镜像并校验数量（期望 11 个 ruoyi/，全 arm64）"
+        run: |
+          docker images --format '{{.Repository}}:{{.Tag}} {{.Architecture}}' | grep '^ruoyi/' | sort
+          n=$(docker images --format '{{.Repository}}' | grep -c '^ruoyi/ruoyi-')
+          echo "ruoyi/ruoyi-* 镜像数 = $n（期望 11）"
+          [ "$n" -eq 11 ]

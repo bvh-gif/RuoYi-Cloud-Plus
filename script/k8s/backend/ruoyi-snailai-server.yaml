@@ -1,0 +1,100 @@
+# ============================================================
+# ruoyi-snailai-server —— AI 服务（前端 /snail-ai/ 直连，端口 8900）
+# ------------------------------------------------------------
+# 前置依赖：同命名空间需有 nacos 这个 Service（nacos:8848）。
+# 镜像名必须和 docker-compose 一致：ruoyi/ruoyi-snailai-server:6.0.0
+# 重要：原 docker-compose 里 Docling / PaddleOCR 指向 127.0.0.1（host 模式），
+#       在 k8s 必须改成对应 Service 名（若 Docling / PaddleOCR 也部署进集群）。
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ruoyi-snailai-server
+  namespace: ruoyi
+  labels:
+    app: ruoyi-snailai-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ruoyi-snailai-server
+  template:
+    metadata:
+      labels:
+        app: ruoyi-snailai-server
+    spec:
+      containers:
+        - name: ruoyi-snailai-server
+          image: ruoyi/ruoyi-snailai-server:6.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8900
+            - name: extra
+              containerPort: 18888
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+            - name: SPRING_CLOUD_NACOS_SERVER_ADDR
+              value: nacos:8848
+            - name: JAVA_OPTS
+              value: "-XX:MaxRAMPercentage=75.0 -Duser.timezone=Asia/Shanghai"
+            # ↓↓↓ k8s 下把 127.0.0.1 换成 Docling / PaddleOCR 的 Service 名（若已部署）↓↓↓
+            # - name: SNAIL_AI_RAG_DOCLING_ENABLED
+            #   value: "true"
+            # - name: SNAIL_AI_RAG_DOCLING_URL
+            #   value: "http://docling:5100"
+            # - name: SNAIL_AI_RAG_DOCLING_PADDLE_OCR_ENABLED
+            #   value: "true"
+            # - name: SNAIL_AI_RAG_DOCLING_PADDLE_OCR_URL
+            #   value: "http://paddleocr:8866/ocr"
+          readinessProbe:
+            tcpSocket:
+              port: 8900
+            initialDelaySeconds: 40
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8900
+            initialDelaySeconds: 80
+            periodSeconds: 15
+          resources:
+            # AI 服务偏重，按实际模型/并发调
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          volumeMounts:
+            - name: logs
+              mountPath: /ruoyi/snailai/logs
+            - name: upload
+              mountPath: /ruoyi/snailai/upload
+      volumes:
+        - name: logs
+          emptyDir: {}
+        # upload 是业务上传数据，生产务必换成 PVC 做持久化，否则 Pod 重建即丢
+        - name: upload
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ruoyi-snailai-server
+  namespace: ruoyi
+  labels:
+    app: ruoyi-snailai-server
+spec:
+  type: ClusterIP
+  selector:
+    app: ruoyi-snailai-server
+  ports:
+    - name: http
+      port: 8900
+      targetPort: 8900
+      protocol: TCP
+    # 18888 按需暴露（若前端/内部需要），取消下面注释即可
+    # - name: extra
+    #   port: 18888
+    #   targetPort: 18888

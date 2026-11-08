@@ -1,0 +1,80 @@
+# ============================================================
+# nacos —— 服务注册/配置中心（所有微服务的发现依赖）
+# ------------------------------------------------------------
+# 必须与业务 Pod 同命名空间 ruoyi，且 Service 名为 nacos（端口 8848），
+# 业务容器靠 env SPRING_CLOUD_NACOS_SERVER_ADDR=nacos:8848 连上来。
+# 这里用 standalone + 关鉴权，对齐开发态的 docker-compose.nacos-noauth 覆盖层；
+# 生产请改 NACOS_AUTH_ENABLE=true 并配好凭据。
+# 存储用内嵌 Derby（与当前离线环境一致）；测试足够。生产建议挂外部 MySQL + PVC。
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nacos
+  namespace: ruoyi
+  labels:
+    app: nacos
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nacos
+  template:
+    metadata:
+      labels:
+        app: nacos
+    spec:
+      containers:
+        - name: nacos
+          image: nacos/nacos-server:v3.2.3
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: main
+              containerPort: 8848
+            - name: console
+              containerPort: 18080
+          env:
+            - name: MODE
+              value: "standalone"
+            - name: NACOS_AUTH_ENABLE
+              value: "false"
+            - name: TZ
+              value: Asia/Shanghai
+          readinessProbe:
+            tcpSocket:
+              port: 8848
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8848
+            initialDelaySeconds: 60
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1Gi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nacos
+  namespace: ruoyi
+  labels:
+    app: nacos
+spec:
+  type: ClusterIP
+  selector:
+    app: nacos
+  ports:
+    - name: main
+      port: 8848
+      targetPort: 8848
+      protocol: TCP
+    - name: console
+      port: 18080
+      targetPort: 18080
+      protocol: TCP

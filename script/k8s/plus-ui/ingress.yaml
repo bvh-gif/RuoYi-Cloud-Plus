@@ -1,0 +1,26 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: plus-ui
+  namespace: ruoyi
+  annotations:
+    # 透传超时（AI/SSE 长连接需要，与 nginx.conf 里的 86400s 对齐）
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "86400"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "86400"
+    # 上传大小上限（与 nginx.conf client_max_body_size 100m 对齐，取较小值生效）
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: ruoyi.example.com   # 改成你的域名（或删掉 host 用 IP/通配）
+      http:
+        paths:
+          # 单条规则即可：浏览器所有请求（页面 + /prod-api + /snail-ai）都先到 plus-ui 的 nginx，
+          # 再由 pod 内 nginx 反代到网关 / snailai。这就是"同源、免 CORS"的方案 A。
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: plus-ui
+                port:
+                  number: 80

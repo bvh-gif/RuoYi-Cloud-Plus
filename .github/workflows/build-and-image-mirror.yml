@@ -1,0 +1,238 @@
+# build-and-image-mirror.yml —— 标准 GitHub Actions 格式（「在线走公共镜像」版）
+#
+# 与同目录 build-and-image.yml 的区别：
+#   build-and-image.yml         → 依赖走 Maven Central 默认（或离线仓库），仅构建后端 11 个镜像；
+#   build-and-image-mirror.yml  → ① Maven 依赖走「阿里云公共镜像」、② 前端 pnpm 依赖走「npmmirror」，
+#                                 ③ 额外构建前端 ruoyi-web 镜像；仍然「只跑到构建镜像这一步」，
+#                                 不做 Nexus 上传 / 不起栈冒烟。
+#
+# 适用场景：runner 能访问公网（阿里云 Maven 镜像、npmmirror、Gitee、Docker Hub）时，用镜像加速拉取。
+# 与贵司内网离线方案（.gitea/workflows/back.yml + plus-ui/.gitea/workflows/front.yml，走 Nexus+预置离线包）
+# 是两条互补路径：内网断网约 Nexus 离线包；公网环境约这份「镜像加速」版更快。
+#
+# 跨架构：目标镜像均为 linux/arm64。x86 runner 上靠 buildx + QEMU 模拟构建；
+#         若 runner 本身是 arm64（如贵司 Gitea 的 ubuntu-latest 标签机器），QEMU 无害。
+#
+# 运行：
+#   - GitHub：推到仓库 → Actions → 选本工作流 → Run workflow（可填 tag / 前端仓库地址）；
+#             push 到 6.X / docs/project-progress 或开 PR 也会自动触发。
+#   - 贵司 Gitea：把每个 `uses:` 的 `actions/...` 前缀改成内部代理 `http://32.61.79.150:30003/actions/...`
+#     （与 .gitea/workflows/back.yml 一致），其余逻辑不变。
+
+name: build-and-image-mirror
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "镜像版本标签（须与 pom <revision> / docker-compose 一致）"
+        required: false
+        default: "6.0.0"
+      frontend_repo:
+        description: "前端 plus-ui 仓库地址（仅 build-frontend 作业用）"
+        required: false
+        default: "https://gitee.com/JavaLionLi/plus-ui.git"
+      platform:
+        description: "目标架构：linux/arm64（生产，x86 上需 QEMU 较慢）或 linux/amd64（x86 原生免 QEMU，仅测试用）"
+        required: false
+        default: "linux/arm64"
+  push:
+    branches: ["6.X", "docs/project-progress"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TAG: "6.0.0"                              # 默认标签；workflow_dispatch 的 tag 输入会覆盖
+  JAVA_VERSION: "21"
+  MAVEN_MIRROR: "https://maven.aliyun.com/repository/public"   # Maven 依赖镜像（替代 Maven Central）
+  NPM_MIRROR: "https://registry.npmmirror.com"                # npm / pnpm 依赖镜像（替代 npmjs.org）
+  # Docker Hub 基础镜像（bellsoft / arm64v8/nginx）的镜像加速器；置空则直连 Docker Hub。
+  # 常见可选值示例（按贵司网络可达性自行选取，留空即用默认）：
+  #   https://docker.m.daocloud.io   /   https://hub-mirror.c.163.com   /   https://mirror.baidubce.com
+  DOCKER_MIRROR: ""
+
+jobs:
+  # ============================================================================
+  # 后端：Maven 走阿里云镜像 → 编译整仓 → 构建 11 个 arm64 业务镜像
+  # ============================================================================
+  build-backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: "检出代码"
+        uses: actions/checkout@v4
+
+      - name: "Set up JDK 21（Liberica，与 bellsoft 运行时同源）"
+        uses: actions/setup-java@v4
+        with:
+          distribution: "liberica"
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: "maven"
+
+      - name: "生成 Maven settings.xml（Central → 阿里云公共镜像）"
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.m2
+          # settings.xml 不认环境变量，所以用 printf 把真实 URL 写死进文件。
+          # （不用 heredoc：GHA 的 run: 块里缩进的 EOF 终结符会被 bash 误判，导致脚本断裂。）
+          printf '<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"\n          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"\n          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0\n                              https://maven.apache.org/xsd/settings-1.0.0.xsd">\n  <mirrors>\n    <mirror>\n      <id>aliyun-public</id>\n      <name>Aliyun Public Mirror</name>\n      <url>%s</url>\n      <mirrorOf>*</mirrorOf>\n    </mirror>\n  </mirrors>\n</settings>\n' "$MAVEN_MIRROR" > ~/.m2/settings.xml
+          echo "=== settings.xml ==="; cat ~/.m2/settings.xml
+
+      - name: "Maven 编译（在线拉取依赖，走阿里云镜像；跳过测试 → 产出 49 个 jar）"
+        env:
+          MAVEN_OPTS: "-Xmx2g"
+        run: |
+          chmod +x ./mvnw
+          # 注意：此处不用 -o（离线），改为在线走镜像；settings.xml 已统一指向阿里云。
+          ./mvnw -B -ntp clean install -DskipTests
+
+      - name: "（可选）配置 Docker Hub 镜像加速器"
+        if: ${{ env.DOCKER_MIRROR != '' }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/buildkit
+          # 不用 heredoc：缩进的 EOF 终结符在 GHA run: 块里会被 bash 误判。
+          printf '[registry."docker.io"]\n  mirrors = ["%s"]\n' "$DOCKER_MIRROR" > /tmp/buildkit/buildkitd.toml
+          docker buildx create --name mirror-builder --driver docker-container \
+            --config /tmp/buildkit/buildkitd.toml --use
+          docker buildx inspect --bootstrap
+
+      - name: "Set up QEMU（跨架构构建 arm64；原生 arm64 runner 可省略但无害）"
+        uses: docker/setup-qemu-action@v3
+
+      - name: "Set up Docker Buildx"
+        uses: docker/setup-buildx-action@v3
+
+      - name: "构建 11 个业务镜像（--platform 可选，--load 载入本地 daemon）"
+        run: |
+          set -euo pipefail
+          # 模块目录 -> 镜像名（取自 script/build-images.sh 的 MODULES，已逐目录核实 Dockerfile 存在）
+          # 注意：compose 虽引用 ruoyi/ruoyi-demo，但 MODULES 不含它，本流水线永不产出。
+          MODULES=(
+            "ruoyi-gateway:ruoyi/ruoyi-gateway"
+            "ruoyi-auth:ruoyi/ruoyi-auth"
+            "ruoyi-modules/ruoyi-system:ruoyi/ruoyi-system"
+            "ruoyi-modules/ruoyi-gen:ruoyi/ruoyi-gen"
+            "ruoyi-modules/ruoyi-job:ruoyi/ruoyi-job"
+            "ruoyi-modules/ruoyi-resource:ruoyi/ruoyi-resource"
+            "ruoyi-modules/ruoyi-workflow:ruoyi/ruoyi-workflow"
+            "ruoyi-modules/ruoyi-ai:ruoyi/ruoyi-ai"
+            "ruoyi-visual/ruoyi-monitor:ruoyi/ruoyi-monitor"
+            "ruoyi-visual/ruoyi-snailjob-server:ruoyi/ruoyi-snailjob-server"
+            "ruoyi-visual/ruoyi-snailai-server:ruoyi/ruoyi-snailai-server"
+          )
+          TAG="${{ github.event.inputs.tag || env.TAG }}"
+          PLATFORM="${{ github.event.inputs.platform || 'linux/arm64' }}"
+          fail=0
+          for entry in "${MODULES[@]}"; do
+            dir="${entry%%:*}"
+            image="${entry##*:}"
+            echo "=============================================================="
+            echo "build $image:$TAG  <- $dir  (platform=$PLATFORM)"
+            echo "=============================================================="
+            if docker buildx build --platform "$PLATFORM" --load -t "$image:$TAG" "./$dir"; then
+              echo "OK   $image:$TAG"
+            else
+              echo "FAIL $image"
+              fail=$((fail + 1))
+            fi
+          done
+          [ "$fail" -eq 0 ]
+
+      - name: "列出产物镜像并校验数量（期望 11 个 ruoyi/，全 arm64）"
+        run: |
+          docker images --format '{{.Repository}}:{{.Tag}} {{.Architecture}}' | grep '^ruoyi/' | sort
+          n=$(docker images --format '{{.Repository}}' | grep -c '^ruoyi/ruoyi-')
+          echo "ruoyi/ruoyi-* 镜像数 = $n（期望 11）"
+          [ "$n" -eq 11 ]
+
+  # ============================================================================
+  # 前端：pnpm 走 npmmirror → 克隆 plus-ui → 构建 dist → 构建 ruoyi-web(arm64) 镜像
+  # 与后端作业相互独立，可并行；同样只跑到构建镜像这一步。
+  # ============================================================================
+  build-frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: "克隆前端源码 plus-ui"
+        env:
+          FRONTEND_REPO: ${{ github.event.inputs.frontend_repo || 'https://gitee.com/JavaLionLi/plus-ui.git' }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 "$FRONTEND_REPO" plus-ui
+          echo "=== plus-ui 关键文件 ==="
+          ls -1 plus-ui | head -20
+
+      - name: "Set up Node 22 + 启用 pnpm（corepack）"
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+          cache-dependency-path: "plus-ui/pnpm-lock.yaml"
+
+      - name: "配置 npmmirror 镜像并激活 pnpm@10.34.5（与 package.json packageManager 对齐）"
+        env:
+          COREPACK_NPM_REGISTRY: ${{ env.NPM_MIRROR }}   # corepack 下载 pnpm 包本身也走镜像
+          npm_config_registry: ${{ env.NPM_MIRROR }}      # pnpm/npm 运行时统一走镜像
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@10.34.5 --activate
+          pnpm config set registry "${{ env.NPM_MIRROR }}"
+          echo "--- node / pnpm 版本 ---"
+          node --version
+          pnpm --version
+          echo "--- 生效 registry ---"
+          pnpm config get registry
+
+      - name: "pnpm install（在线拉取依赖，走 npmmirror；--frozen-lockfile 锁定版本）"
+        working-directory: plus-ui
+        env:
+          npm_config_registry: ${{ env.NPM_MIRROR }}
+        run: |
+          pnpm install --frozen-lockfile
+
+      - name: "pnpm build（= vite build --mode production → 产出 dist/）"
+        working-directory: plus-ui
+        run: |
+          pnpm build
+          echo "=== dist 文件数 ==="
+          find dist -type f | wc -l
+
+      - name: "（可选）配置 Docker Hub 镜像加速器"
+        if: ${{ env.DOCKER_MIRROR != '' }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/buildkit
+          # 不用 heredoc：缩进的 EOF 终结符在 GHA run: 块里会被 bash 误判。
+          printf '[registry."docker.io"]\n  mirrors = ["%s"]\n' "$DOCKER_MIRROR" > /tmp/buildkit/buildkitd.toml
+          docker buildx create --name mirror-builder-fx --driver docker-container \
+            --config /tmp/buildkit/buildkitd.toml --use
+          docker buildx inspect --bootstrap
+
+      - name: "Set up QEMU（arm64v8/nginx 基础镜像仅 arm64；x86 上需 QEMU 模拟）"
+        uses: docker/setup-qemu-action@v3
+
+      - name: "Set up Docker Buildx"
+        uses: docker/setup-buildx-action@v3
+
+      - name: "构建 ruoyi-web 镜像（固定 arm64：基础镜像 arm64v8/nginx 仅 arm64）"
+        working-directory: plus-ui
+        run: |
+          set -euo pipefail
+          # 前端基础镜像为 arm64v8/nginx:alpine（仅 arm64 单架构），故 ruoyi-web 始终按 arm64 构建；
+          # 在 x86 上仅做 COPY/CHOWN（无重二进制执行），QEMU 开销极小。
+          # 若需 amd64 前端，改 plus-ui/Dockerfile 的 FROM 为 nginx:alpine 再切 platform。
+          TAG="${{ github.event.inputs.tag || env.TAG }}"
+          docker buildx build --platform linux/arm64 --load -t "ruoyi/ruoyi-web:$TAG" .
+          echo "OK ruoyi/ruoyi-web:$TAG"
+
+      - name: "校验前端镜像（期望 1 个 ruoyi-web，arm64）"
+        run: |
+          docker images --format '{{.Repository}}:{{.Tag}} {{.Architecture}}' | grep 'ruoyi-web' | sort
+          n=$(docker images --format '{{.Repository}}' | grep -c '^ruoyi/ruoyi-web$')
+          echo "ruoyi/ruoyi-web 镜像数 = $n（期望 1）"
+          [ "$n" -eq 1 ]

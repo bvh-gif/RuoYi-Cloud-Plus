@@ -1,0 +1,67 @@
+# ruoyi-monitor —— Spring Boot Admin 监控服务
+# 前置依赖：nacos:8848（聚合各服务健康）。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ruoyi-monitor
+  namespace: ruoyi
+  labels:
+    app: ruoyi-monitor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ruoyi-monitor
+  template:
+    metadata:
+      labels:
+        app: ruoyi-monitor
+    spec:
+      containers:
+        - name: ruoyi-monitor
+          image: ruoyi/ruoyi-monitor:6.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 9100
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+            - name: SPRING_CLOUD_NACOS_SERVER_ADDR
+              value: nacos:8848
+            - name: JAVA_OPTS
+              value: "-XX:MaxRAMPercentage=75.0 -Duser.timezone=Asia/Shanghai"
+          readinessProbe:
+            tcpSocket:
+              port: 9100
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 9100
+            initialDelaySeconds: 60
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ruoyi-monitor
+  namespace: ruoyi
+  labels:
+    app: ruoyi-monitor
+spec:
+  type: ClusterIP
+  selector:
+    app: ruoyi-monitor
+  ports:
+    - name: http
+      port: 9100
+      targetPort: 9100
+      protocol: TCP

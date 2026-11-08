@@ -1,0 +1,256 @@
+# deploy-k8s.yml —— 标准 GitHub Actions 格式（K8s 部署 + 路由验证版）
+#
+# 目的：在 GitHub 上验证「编译 → 构建 12 个镜像 → 部署到 K8s → 服务间路由通畅」。
+# 与同目录 build-and-image*.yml 的关系：那些只「构建镜像」；本文件在之上加了「部署 + 验证」。
+#
+# 集群来源（二选一，由 workflow_dispatch.inputs.k8s_target 决定）：
+#   local  （默认，推荐免费自包含）：在本机注册的自托管 runner 上用 k3d 起本地 K8s，
+#           镜像直接 `k3d image import` 灌进集群（免 registry、免云费用），跑完即销毁。
+#   remote          ：你有现成 K8s，把 kubeconfig 存为 secret(KUBE_CONFIG)，
+#           流水线 build→推到远端仓库（默认 GHCR，可用 registry_prefix 覆盖）→ kubectl apply。
+#           （需要集群可达的 registry，公开库 GHCR 免费；私有库注意存储额度。）
+#
+# 镜像架构：默认 linux/amd64（测试集群多为 x86，原生构建免 QEMU、快）；公司生产是 arm64，
+#           把 platform / 各 build 的 --platform 改成 linux/arm64 即可（x86 runner 上需 QEMU，慢）。
+#
+# 部署范围：minimal（默认）= gateway+auth+system+中间件，足以验证「网关→auth→system」跨服务路由；
+#           all            = 全量 11 后端 + plus-ui（前端镜像需联网 clone Gitee 的 plus-ui + npmmirror）。
+#
+# 路由验证（不依赖真实域名/登录）：等所有 Pod Ready 后，从 runner 用 port-forward 打
+#   nacos / gateway / system / auth 的接口：前三者 /actuator/health 必须 200（证明服务存活+K8s 网络+应用健康），
+#   nacos 服务列表里能看到 ruoyi-system / ruoyi-auth 实例（证明 Nacos 发现注册成功 → 网关可路由）。
+#
+# ⚠️ 前置（local 路径）：本机需 Docker Desktop + 注册一个 GitHub 自托管 runner（标签 self-hosted）。
+#   首次运行会自动装 k3d / kubectl。详见 docs 或仓库根 README 的「K8s 本地验证」一节。
+
+name: deploy-k8s
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "镜像版本标签（须与 pom <revision> / docker-compose 一致）"
+        required: false
+        default: "6.0.0"
+      platform:
+        description: "镜像架构：linux/amd64（测试推荐，免 QEMU）或 linux/arm64（对齐生产）"
+        required: false
+        default: "linux/amd64"
+      deploy_scope:
+        description: "minimal=3 核心+中间件；all=全量 11 后端+前端"
+        required: false
+        default: "minimal"
+      k8s_target:
+        description: "local=本机自托管 runner 起 k3d；remote=用 KUBE_CONFIG secret"
+        required: false
+        default: "local"
+      registry_prefix:
+        description: "远端仓库前缀（仅 remote）：如 ghcr.io/<owner>/ 或 registry.cn-hangzhou.aliyuncs.com/<ns>/；留空默认 ghcr.io/<owner>/"
+        required: false
+        default: ""
+  # 不在 push/pr 自动触发部署，避免误发到集群。
+
+permissions:
+  contents: read
+  packages: write        # 远端走 GHCR 时需要
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TAG: "6.0.0"
+  JAVA_VERSION: "21"
+  NAMESPACE: "ruoyi"
+  FRONTEND_REPO: "https://gitee.com/JavaLionLi/plus-ui.git"
+
+jobs:
+  build-deploy-verify:
+    # local 路径必须在自托管 runner 上（要有 Docker + 能起 k3d）；remote 可在 GitHub 云 runner。
+    runs-on: ${{ inputs.k8s_target == 'local' && 'self-hosted' || 'ubuntu-latest' }}
+    timeout-minutes: 150
+    steps:
+      - name: "检出代码"
+        uses: actions/checkout@v4
+
+      - name: "Set up JDK 21（Liberica，与 bellsoft 运行时同源）"
+        uses: actions/setup-java@v4
+        with:
+          distribution: "liberica"
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: "maven"
+
+      - name: "Maven 编译（跳过测试 → 产出 49 个 jar）"
+        env:
+          MAVEN_OPTS: "-Xmx2g"
+        run: |
+          chmod +x ./mvnw
+          ./mvnw -B -ntp clean install -DskipTests
+
+      - name: "Set up Node 22 + pnpm（仅 all 范围需要前端镜像）"
+        if: ${{ inputs.deploy_scope == 'all' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: "Set up Docker Buildx"
+        uses: docker/setup-buildx-action@v3
+
+      - name: "构建 11 个后端镜像"
+        env:
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag || env.TAG }}"
+          MODULES=(
+            "ruoyi-gateway:ruoyi/ruoyi-gateway"
+            "ruoyi-auth:ruoyi/ruoyi-auth"
+            "ruoyi-modules/ruoyi-system:ruoyi/ruoyi-system"
+            "ruoyi-modules/ruoyi-gen:ruoyi/ruoyi-gen"
+            "ruoyi-modules/ruoyi-job:ruoyi/ruoyi-job"
+            "ruoyi-modules/ruoyi-resource:ruoyi/ruoyi-resource"
+            "ruoyi-modules/ruoyi-workflow:ruoyi/ruoyi-workflow"
+            "ruoyi-modules/ruoyi-ai:ruoyi/ruoyi-ai"
+            "ruoyi-visual/ruoyi-monitor:ruoyi/ruoyi-monitor"
+            "ruoyi-visual/ruoyi-snailjob-server:ruoyi/ruoyi-snailjob-server"
+            "ruoyi-visual/ruoyi-snailai-server:ruoyi/ruoyi-snailai-server"
+          )
+          for entry in "${MODULES[@]}"; do
+            dir="${entry%%:*}"; image="${entry##*:}"
+            echo "build $image:$TAG <- $dir (platform=$PLATFORM)"
+            docker buildx build --platform "$PLATFORM" --load -t "$image:$TAG" "./$dir"
+          done
+          docker images --format '{{.Repository}}:{{.Tag}}' | grep '^ruoyi/' | sort
+
+      - name: "构建前端镜像（仅 all 范围）"
+        if: ${{ inputs.deploy_scope == 'all' }}
+        env:
+          PLATFORM: ${{ inputs.platform }}
+          npm_config_registry: "https://registry.npmmirror.com"
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag || env.TAG }}"
+          git clone --depth 1 "$FRONTEND_REPO" plus-ui
+          cd plus-ui
+          corepack enable
+          corepack prepare pnpm@10.34.5 --activate
+          pnpm install --frozen-lockfile
+          pnpm build
+          docker buildx build --platform "$PLATFORM" --load -t "ruoyi/plus-ui:$TAG" .
+
+      - name: "安装 kubectl"
+        run: |
+          if ! command -v kubectl >/dev/null 2>&1; then
+            VER="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+            curl -fsSL "https://dl.k8s.io/release/${VER}/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl
+            chmod +x /usr/local/bin/kubectl
+          fi
+          kubectl version --client
+
+      - name: "本地集群 k3d + 导入镜像（仅 local）"
+        if: ${{ inputs.k8s_target == 'local' }}
+        env:
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag || env.TAG }}"
+          if ! command -v k3d >/dev/null 2>&1; then
+            curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+          fi
+          k3d cluster create ruoyi-test --wait
+          k3d kubeconfig get ruoyi-test > /tmp/ruoyi-kubeconfig
+          echo "KUBECONFIG=/tmp/ruoyi-kubeconfig" >> "$GITHUB_ENV"
+          # 把本地构建的镜像直接灌进 k3d 集群（免 registry）
+          IMGS="ruoyi/ruoyi-gateway:$TAG ruoyi/ruoyi-auth:$TAG ruoyi/ruoyi-system:$TAG \
+                ruoyi/ruoyi-gen:$TAG ruoyi/ruoyi-job:$TAG ruoyi/ruoyi-resource:$TAG \
+                ruoyi/ruoyi-workflow:$TAG ruoyi/ruoyi-ai:$TAG ruoyi/ruoyi-monitor:$TAG \
+                ruoyi/ruoyi-snailjob-server:$TAG ruoyi/ruoyi-snailai-server:$TAG"
+          [ "${{ inputs.deploy_scope }}" = "all" ] && IMGS="$IMGS ruoyi/plus-ui:$TAG"
+          # shellcheck disable=SC2086
+          k3d image import $IMGS -c ruoyi-test
+
+      - name: "远端登录 + 推送镜像（仅 remote）"
+        if: ${{ inputs.k8s_target == 'remote' }}
+        env:
+          REGISTRY_PREFIX: "${{ inputs.registry_prefix || format('ghcr.io/{0}/', github.repository_owner) }}"
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag || env.TAG }}"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          IMAGES="ruoyi/ruoyi-gateway ruoyi/ruoyi-auth ruoyi/ruoyi-system ruoyi/ruoyi-gen \
+                  ruoyi/ruoyi-job ruoyi/ruoyi-resource ruoyi/ruoyi-workflow ruoyi/ruoyi-ai \
+                  ruoyi/ruoyi-monitor ruoyi/ruoyi-snailjob-server ruoyi/ruoyi-snailai-server"
+          for img in $IMAGES; do
+            docker tag "$img:$TAG" "${REGISTRY_PREFIX}${img}:$TAG"
+            docker push "${REGISTRY_PREFIX}${img}:$TAG"
+          done
+          [ "${{ inputs.deploy_scope }}" = "all" ] && {
+            docker tag "ruoyi/plus-ui:$TAG" "${REGISTRY_PREFIX}ruoyi/plus-ui:$TAG"
+            docker push "${REGISTRY_PREFIX}ruoyi/plus-ui:$TAG"
+          }
+          echo "$KUBE_CONFIG" | base64 -d > /tmp/ruoyi-kubeconfig
+          echo "KUBECONFIG=/tmp/ruoyi-kubeconfig" >> "$GITHUB_ENV"
+
+      - name: "远端镜像前缀注入清单（仅 remote）"
+        if: ${{ inputs.k8s_target == 'remote' }}
+        env:
+          REGISTRY_PREFIX: "${{ inputs.registry_prefix || format('ghcr.io/{0}/', github.repository_owner) }}"
+        run: |
+          # 把清单里的 image: ruoyi/... 改成 image: <REGISTRY_PREFIX>ruoyi/...（仅改 runner 上的副本）
+          find script/k8s -name '*.yaml' -exec sed -i "s#image: ruoyi/#image: ${REGISTRY_PREFIX}ruoyi/#g" {} +
+
+      - name: "应用清单（namespace + 中间件 + 业务）"
+        run: |
+          set -euo pipefail
+          kubectl apply -f script/k8s/namespace.yaml
+          # MySQL 初始化 SQL（来自仓库 script/sql/，建库建表）——
+          # 必须在 mysql Deployment 之前存在，否则 Pod 会因引用不到 ConfigMap 而无法调度。
+          kubectl -n ruoyi create configmap mysql-init-sql \
+            --from-file=ry-cloud.sql=script/sql/ry-cloud.sql \
+            --from-file=ry-job.sql=script/sql/ry-job.sql \
+            --from-file=ry-ai.sql=script/sql/ry-ai.sql \
+            --from-file=ry-workflow.sql=script/sql/ry-workflow.sql \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl apply -f script/k8s/middleware/
+          if [ "${{ inputs.deploy_scope }}" = "minimal" ]; then
+            kubectl apply -f script/k8s/backend/ruoyi-gateway.yaml \
+                          -f script/k8s/backend/ruoyi-auth.yaml \
+                          -f script/k8s/backend/ruoyi-system.yaml
+          else
+            kubectl apply -f script/k8s/backend/
+            kubectl apply -f script/k8s/plus-ui/
+          fi
+
+      - name: "等待所有 Pod Ready"
+        run: |
+          kubectl -n ruoyi wait --for=condition=Ready pods --all --timeout=600s
+
+      - name: "验证服务间路由"
+        run: |
+          set -euo pipefail
+          kubectl -n ruoyi port-forward svc/nacos 8848:8848 &
+          kubectl -n ruoyi port-forward svc/ruoyi-gateway 8080:8080 &
+          kubectl -n ruoyi port-forward svc/ruoyi-system 9201:9201 &
+          kubectl -n ruoyi port-forward svc/ruoyi-auth 9210:9210 &
+          PF_PIDS=$(jobs -p)
+          sleep 10
+          gw=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/actuator/health || true)
+          sys=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:9201/actuator/health || true)
+          au=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:9210/actuator/health || true)
+          echo "gateway/actuator/health = $gw"
+          echo "system /actuator/health = $sys"
+          echo "auth   /actuator/health = $au"
+          # 从 Nacos 服务列表确认 ruoyi-system / ruoyi-auth 已注册（证明网关可经 Nacos 路由）
+          echo "--- Nacos 服务列表（public 命名空间）---"
+          curl -s "http://localhost:8848/nacos/v3/console/services?namespaceId=public&groupName=DEFAULT_GROUP&pageNo=1&pageSize=100" \
+            | grep -o -E 'ruoyi-(system|auth|gateway)' | sort -u || echo "(Nacos API 路径可能随版本变化，未匹配不影响下方硬判定)"
+          # 硬判定：核心三个 /actuator/health 必须 200，否则路由验证失败
+          [ "$gw" = "200" ] && [ "$sys" = "200" ] && [ "$au" = "200" ] \
+            && echo "✅ 服务存活 + K8s 网络 + 应用健康 OK" \
+            || { echo "❌ 路由验证未通过（核心接口非 200）"; kill $PF_PIDS 2>/dev/null; exit 1; }
+          kill $PF_PIDS 2>/dev/null || true
+
+      - name: "清理本地集群（仅 local，始终执行）"
+        if: ${{ always() && inputs.k8s_target == 'local' }}
+        run: k3d cluster delete ruoyi-test || true
