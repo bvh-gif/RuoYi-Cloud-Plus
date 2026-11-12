@@ -1,0 +1,68 @@
+# .gitea/workflows/ci-local-backend.yml
+# 【本地验证版】不依赖公司内网供应链：
+#   - 用仓库自带 ./mvnw（不连内网文件服务器下载 JDK/Maven）
+#   - 依赖来自本机 ~/.m2（离线优先 -o；未缓存可去掉 -o，由 runner 连内网 Nexus 解析）
+#   - 镜像只在本地 docker 构建，不推 Nexus / 不推 Harbor
+#   - 可选：拉起 minimal 栈 + verify-stack.sh 做端到端验收（验证"业务可用"，而非仅 HTTP 200）
+#
+# 适用：开发者在本机 / 自托管 runner（已装 JDK21 + Docker）上验证"能否构建并真正跑起来"，
+#       再决定是否用内网版(ci-intranet-backend.yml)发布。
+# 纯本机无 runner 验证：跳过本 workflow，直接跑 ./mvnw + docker build + script/stack.sh 即可。
+#
+# 与内网版区别：无内部 actions/JDK/Maven/Nexus 地址；无镜像发布步骤；默认 tag=6.0.0 对齐 compose。
+
+name: "RCP 本地验证"
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '镜像标签（默认 6.0.0 以对齐 compose）'
+        default: '6.0.0'
+      verify:
+        description: '构建后拉起 minimal 栈做端到端验收'
+        type: boolean
+        default: true
+  pull_request:
+
+jobs:
+  build-verify:
+    runs-on: 'ubuntu-latest'
+    timeout-minutes: 90
+    env:
+      TAG: ${{ github.event.inputs.tag || '6.0.0' }}
+    steps:
+      - name: "克隆代码"
+        uses: "http://32.61.79.150:30003/actions/checkout@v4"
+
+      - name: "检查本机 JDK21"
+        run: java -version 2>&1 | head -3
+
+      - name: "多模块构建（本机 ~/.m2 离线优先）"
+        run: |
+          chmod +x ./mvnw
+          ./mvnw -B -o clean install -DskipTests   # -o 离线；若 ~/.m2 未缓存可去掉 -o
+
+      - name: "本地构建 11 个业务镜像"
+        run: |
+          set -euo pipefail
+          # 目录 -> 镜像名（单一真相源：offline-arm-bundle/MODULES.env 的 RUOYI_MODULES，严格匹配 docker-compose.yml）
+          RUOYI_MODULES=()
+          [ -f "$GITHUB_WORKSPACE/offline-arm-bundle/MODULES.env" ] && . "$GITHUB_WORKSPACE/offline-arm-bundle/MODULES.env"
+          MODULES=("${RUOYI_MODULES[@]}")
+          fail=0
+          for entry in "${MODULES[@]}"; do
+            dir="${entry%%:*}"; image="${entry##*:}"
+            echo "==> build ${image}:${TAG} <- ${dir}"
+            docker build -t "${image}:${TAG}" "./${dir}" || { echo "::error::失败 ${image}"; fail=$((fail+1)); }
+          done
+          exit $fail
+
+      - name: "端到端验收（默认开；PR 不触发）"
+        if: ${{ github.event.inputs.verify == 'true' }}
+        run: |
+          ./script/stack.sh minimal up
+          ./script/verify-stack.sh
+
+      - name: "回收（始终执行）"
+        if: always()
+        run: ./script/stack.sh minimal down || true

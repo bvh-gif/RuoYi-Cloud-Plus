@@ -1,0 +1,326 @@
+# Makefile.ci —— CI/CD 流水线「领域逻辑」封装（由 .github/workflows/ci-make.yml 调用，也可本地复用）
+#
+# 设计原则：
+#   环境准备（JDK / Node / buildx / QEMU 安装）交给 workflow 的 actions 步骤；
+#   本文件只封装领域逻辑：编译、构建镜像、起 k3d 集群、部署、验证、清理。
+#   这样逻辑在 GitHub Actions 与本地（WSL2 + Docker + k3d）复用同一套，单一事实来源。
+#
+# ── 与根 Makefile 的关系（重要，勿合并）──────────────────────────
+#   根 Makefile 管「本机 ./mvnw 编译 + compose 栈」；本文件（Makefile.ci）管「CI 构建镜像 / K8s / 容器化工具链」。
+#   两份职责互斥、刻意分开：CI 流水线一律 `make -f Makefile.ci …`，不要用根 Makefile 跑 CI。
+#   详见 docs/ci-convergence.md §0.6（2026-11-12 用户确认，方案 A：维持双文件）。
+#
+# 变量（均可用命令行覆盖，例：make -f Makefile.ci ci-build PLATFORM=linux/arm64）：
+#   TAG              镜像标签，默认取 offline-arm-bundle/VERSIONS.env 的 RUOYI_REVISION（6.0.0）
+#   PLATFORM         目标架构 = HOST_ARCH（构建/测试机架构，默认 linux/amd64；x86 原生免 QEMU，arm64 需 QEMU 较慢）
+#   SCOPE            minimal=3 核心+中间件；all=全量 11 后端+前端
+#   NAMESPACE        K8s 命名空间，默认 ruoyi
+#   REGISTRY_PREFIX  远端仓库前缀（仅 remote），如 ghcr.io/<owner>/
+#   FRONTEND_REPO    plus-ui 仓库地址（默认取 VERSIONS.env）
+#   PNPM_VERSION     前端构建所用 pnpm 版本（默认取 VERSIONS.env）
+#   HOST_ARCH        构建/测试机架构（默认取 VERSIONS.env）
+#
+# 常用入口：
+#   make -f Makefile.ci ci-build                编译 + 构建 11 后端镜像（验证「能构建打包」）
+#   make -f Makefile.ci ci-build SCOPE=all      上面 + 前端镜像
+#   make -f Makefile.ci ci-deploy-local         本机 k3d 全流程：构建→起集群→导入→部署→验证→清理
+#   make -f Makefile.ci ci-deploy-remote REGISTRY_PREFIX=ghcr.io/<owner>/  推送+远端 apply（需先配 KUBECONFIG）
+
+# ── 变量 ──────────────────────────────────────────────────────────
+# 兜底默认值（仅当下方 VERSIONS.env 索引失败时才生效）
+TAG             ?= 6.0.0
+PLATFORM        ?= linux/amd64
+SCOPE           ?= minimal
+NAMESPACE       ?= ruoyi
+FRONTEND_REPO   ?= https://gitee.com/JavaLionLi/plus-ui.git
+NPM_MIRROR      ?= https://registry.npmmirror.com
+PNPM_VERSION    ?= 10.34.5
+# 容器化编译工具链镜像（版本由下方 VERSIONS.env 索引覆盖；避免 runner 预装 JDK/Maven/Node）
+MVN_IMG         ?= maven:3.9.12-eclipse-temurin-21
+NODE_IMG        ?= node:22.23.4-bookworm
+# 内网离线工具链镜像（单一镜像含 JDK+Maven+Node+离线 Maven 仓库+pnpm store，arm64）
+#   USE_TOOLCHAIN=1 时，mvn-build-img / frontend-build-img 改用 TOOLCHAIN_IMG 跑编译：
+#   - 后端：mvn -o（离线仓库烤入镜像，不挂宿主 ~/.m2）；
+#   - 前端：用烤入的 pnpm-standalone + pnpm-store（arm64 Node 二进制）。
+#   镜像由 runner/Dockerfile 构建、script/ci-toolchain-image.sh 导出，须先 docker load 到 runner 服务器。
+TOOLCHAIN_IMG   ?= ruoyi/ci-toolchain:$(TAG)
+USE_TOOLCHAIN   ?= 0
+HOST_ARCH       ?= linux/amd64
+REGISTRY_PREFIX ?=
+K8S_TARGET      ?= local
+MVNW           := ./mvnw
+# 递归调用本文件时显式带 -f，避免 $(MAKE) 默认去找根目录 Makefile
+MAKE_CI        := make -f Makefile.ci
+
+# ── 索引 VERSIONS.env（单一真相源）──────────────────────────────────────
+#   TAG / FRONTEND_REPO / NPM_MIRROR / PNPM_VERSION / HOST_ARCH 优先取自
+#   offline-arm-bundle/VERSIONS.env；仅当它们仍是下方默认值（即未被 env/命令行
+#   覆盖）时，才用 BOM 值覆盖。改版本/架构只改 VERSIONS.env 一处即可全局生效。
+ifneq (,$(wildcard offline-arm-bundle/VERSIONS.env))
+_RV  := $(shell grep -E '^RUOYI_REVISION=' offline-arm-bundle/VERSIONS.env 2>/dev/null | head -1 | cut -d= -f2-)
+_RFR := $(shell grep -E '^FRONTEND_REPO='  offline-arm-bundle/VERSIONS.env 2>/dev/null | head -1 | cut -d= -f2-)
+_RNM := $(shell grep -E '^NPM_MIRROR='     offline-arm-bundle/VERSIONS.env 2>/dev/null | head -1 | cut -d= -f2-)
+_RPN := $(shell grep -E '^PNPM_VERSION='   offline-arm-bundle/VERSIONS.env 2>/dev/null | head -1 | cut -d= -f2-)
+# HOST_ARCH / TARGET_ARCH 的值含 ${VAR:-default} 表达式，grep 直取会带引号/表达式，
+# 故用 bash source 求值（与脚本一致），返回已展开的架构 token。
+_RMV := $(shell grep -E '^MAVEN_VERSION=' offline-arm-bundle/VERSIONS.env 2>/dev/null | head -1 | cut -d= -f2-)
+_RJAV := $(shell grep -E '^JAVA_VERSION=' offline-arm-bundle/VERSIONS.env 2>/dev/null | head -1 | cut -d= -f2-)
+_RNV := $(shell grep -E '^NODE_VERSION=' offline-arm-bundle/VERSIONS.env 2>/dev/null | head -1 | cut -d= -f2-)
+_HOST_ARCH := $(shell bash -c 'set -a; [ -f offline-arm-bundle/VERSIONS.env ] && source offline-arm-bundle/VERSIONS.env; echo "$$HOST_ARCH"')
+ifneq ($(_RV),)
+ifeq ($(TAG),6.0.0)
+TAG := $(_RV)
+endif
+endif
+ifneq ($(_RFR),)
+ifeq ($(FRONTEND_REPO),https://gitee.com/JavaLionLi/plus-ui.git)
+FRONTEND_REPO := $(_RFR)
+endif
+endif
+ifneq ($(_RNM),)
+ifeq ($(NPM_MIRROR),https://registry.npmmirror.com)
+NPM_MIRROR := $(_RNM)
+endif
+endif
+ifneq ($(_RPN),)
+ifeq ($(PNPM_VERSION),10.34.5)
+PNPM_VERSION := $(_RPN)
+endif
+endif
+ifneq ($(_HOST_ARCH),)
+HOST_ARCH := $(_HOST_ARCH)
+endif
+# PLATFORM（CI 构建机架构）= HOST_ARCH：本机验证走 amd64，迁移 arm 构建机时改 HOST_ARCH 即联动
+PLATFORM := $(HOST_ARCH)
+# 工具链镜像版本由 VERSIONS.env 的 MAVEN_VERSION/JAVA_VERSION/NODE_VERSION 联动覆盖
+ifneq ($(_RMV),)
+ifeq ($(MVN_IMG),maven:3.9.12-eclipse-temurin-21)
+MVN_IMG := maven:$(_RMV)-eclipse-temurin-$(_RJAV)
+endif
+endif
+ifneq ($(_RNV),)
+ifeq ($(NODE_IMG),node:22.23.4-bookworm)
+NODE_IMG := node:$(_RNV)-bookworm
+endif
+endif
+endif
+
+# 11 个后端模块：<模块目录>:<镜像名>
+# 单一真相源：offline-arm-bundle/MODULES.env 的 RUOYI_MODULES（改模块只改那里）。
+# 以下内联列表为「MODULES.env 缺失」时的兜底；存在时以 MODULES.env 为准。
+MODULES := \
+	ruoyi-gateway:ruoyi/ruoyi-gateway \
+	ruoyi-auth:ruoyi/ruoyi-auth \
+	ruoyi-modules/ruoyi-system:ruoyi/ruoyi-system \
+	ruoyi-modules/ruoyi-gen:ruoyi/ruoyi-gen \
+	ruoyi-modules/ruoyi-job:ruoyi/ruoyi-job \
+	ruoyi-modules/ruoyi-resource:ruoyi/ruoyi-resource \
+	ruoyi-modules/ruoyi-workflow:ruoyi/ruoyi-workflow \
+	ruoyi-modules/ruoyi-ai:ruoyi/ruoyi-ai \
+	ruoyi-visual/ruoyi-monitor:ruoyi/ruoyi-monitor \
+	ruoyi-visual/ruoyi-snailjob-server:ruoyi/ruoyi-snailjob-server \
+	ruoyi-visual/ruoyi-snailai-server:ruoyi/ruoyi-snailai-server
+_MODULES_ENV := $(shell bash -c 'set -a; [ -f offline-arm-bundle/MODULES.env ] && source offline-arm-bundle/MODULES.env; for m in "$$RUOYI_MODULES[@]"; do printf "%%s " "$$m"; done' 2>/dev/null)
+ifneq ($(_MODULES_ENV),)
+MODULES := $(_MODULES_ENV)
+endif
+
+# SCOPE=all 时 ci-build（宿主工具路径）额外：前端 dist 构建 + 前端镜像
+ifeq ($(SCOPE),all)
+CI_BUILD_EXTRA := frontend-dist images-frontend
+CI_BUILD_IMG_EXTRA := frontend-build-img images-frontend
+else
+CI_BUILD_EXTRA :=
+CI_BUILD_IMG_EXTRA :=
+endif
+
+.DEFAULT_GOAL := help
+.PHONY: help mvn-build mvn-build-img frontend-build-img frontend-dist \
+        images-backend images-frontend ci-build ci-build-img setup-tools \
+        cluster-up cluster-import cluster-down deploy wait verify \
+        push-images ci-deploy-local ci-deploy-remote
+
+help:
+	@echo "RuoYi-Cloud-Plus CI 流水线（make 驱动）"
+	@echo "  make ci-build                          编译 + 构建 11 后端镜像"
+	@echo "  make ci-build SCOPE=all                上面 + 前端镜像"
+	@echo "  make ci-build-img                      【容器化工具链】镜像内跑 mvn/node 编译 + 构建镜像"
+	@echo "  make ci-build-img SCOPE=all            上面 + 前端镜像"
+	@echo "  make ci-build-img USE_TOOLCHAIN=1 PLATFORM=linux/arm64   内网离线工具链（ruoyi/ci-toolchain）编译"
+	@echo "  make ci-deploy-local                   本机 k3d 全流程（构建→起集群→部署→验证→清理）"
+	@echo "  make ci-deploy-remote REGISTRY_PREFIX=ghcr.io/<owner>/  推送 + 远端 apply"
+	@echo "  make cluster-down                      仅销毁本地 k3d 集群"
+	@echo "覆盖变量：TAG PLATFORM SCOPE NAMESPACE REGISTRY_PREFIX FRONTEND_REPO PNPM_VERSION HOST_ARCH"
+
+# ── 1) Maven 编译（产出 49 个 jar）────────────────────────────────
+mvn-build:
+	chmod +x $(MVNW)
+	$(MVNW) -B -ntp clean install -DskipTests
+
+# ── 2) 构建 11 个后端镜像（--load 载入本地 daemon）────────────────
+#   末尾做镜像数量断言：期望 = $(MODULES) 条目数，漏建一个即硬失败（修复 B 方案的静默降级）。
+images-backend:
+	@expected=0; \
+	for entry in $(MODULES); do \
+		dir=$${entry%%:*}; image=$${entry##*:}; expected=$$((expected+1)); \
+		echo "== build $$image:$(TAG) <- $$dir (platform=$(PLATFORM)) =="; \
+		docker buildx build --platform $(PLATFORM) --load -t $$image:$(TAG) ./$$dir; \
+	done; \
+	built=$$(docker images --filter=reference="ruoyi/ruoyi-*:$(TAG)" -q | wc -l); \
+	echo "==> 后端镜像 $$built / $$expected =="; \
+	if [ "$$built" -ne "$$expected" ]; then echo "FAIL 后端镜像数量不符（期望 $$expected，实际 $$built）"; exit 1; fi
+
+# ── 3) 前端 dist 构建（宿主工具路径，ci-build SCOPE=all 用）─────────
+#   从 Gitee 拉 plus-ui 源码，宿主 Node/pnpm 执行 install + build，产出 plus-ui/dist/。
+frontend-dist:
+	rm -rf plus-ui
+	git clone --depth 1 $(FRONTEND_REPO) plus-ui
+	cd plus-ui && npm install -g pnpm@$(PNPM_VERSION) && pnpm install --frozen-lockfile --registry=$(NPM_MIRROR) && pnpm build
+
+# ── 3b) 构建前端镜像（dist 须已存在；仅 SCOPE=all）─────────────────
+#   只做 docker buildx（nginx 基础镜像，多架构），不再 clone/install（避免与 *-build-img 重复构建）。
+images-frontend:
+	docker buildx build --platform $(PLATFORM) --load -t ruoyi/plus-ui:$(TAG) ./plus-ui
+	@if ! docker image inspect ruoyi/plus-ui:$(TAG) >/dev/null 2>&1; then echo "FAIL ruoyi/plus-ui:$(TAG) 未构建"; exit 1; fi
+	@echo "==> 前端镜像 ruoyi/plus-ui:$(TAG) 构建完成"
+
+# 编译 + 后端镜像（最小「能构建打包」验证）
+ci-build: mvn-build images-backend $(CI_BUILD_EXTRA)
+	@echo "==> ci-build done"
+
+# ── 1b) Maven 编译（容器化：用镜像跑 mvn，不依赖 runner 预装 JDK/Maven）────
+#   默认用 MVN_IMG（公共 maven 镜像，复用宿主 ~/.m2 缓存）；
+#   USE_TOOLCHAIN=1 时改用 TOOLCHAIN_IMG（ruoyi/ci-toolchain，arm64 离线：JDK+Maven+离线仓库烤入镜像），
+#   mvn -o 强制离线（仓库烤入 /opt/ruyi/maven/repository，不挂宿主 ~/.m2）。
+mvn-build-img:
+ifeq ($(USE_TOOLCHAIN),1)
+	docker run --rm --platform $(PLATFORM) --network=none \
+		-v "$(PWD)":/src -w /src \
+		$(TOOLCHAIN_IMG) \
+		mvn -o -B -ntp clean install -DskipTests
+else
+	docker run --rm \
+		-v "$(PWD)":/workspace -w /workspace \
+		-v "$(HOME)/.m2":/root/.m2 \
+		$(MVN_IMG) \
+		mvn -B -ntp clean install -DskipTests
+endif
+
+# ── 3b) 前端编译（容器化：用镜像跑 pnpm，不依赖 runner 预装 Node）────────
+#   默认用 NODE_IMG（公共 node 镜像，corepack 启 pnpm@PNPM_VERSION）；
+#   USE_TOOLCHAIN=1 时改用 TOOLCHAIN_IMG（ruoyi/ci-toolchain，arm64 离线：pnpm-standalone + pnpm-store 烤入镜像）。
+#   dist 产出到 plus-ui/dist/，镜像构建见 images-frontend。
+frontend-build-img:
+	rm -rf plus-ui
+	git clone --depth 1 $(FRONTEND_REPO) plus-ui
+ifeq ($(USE_TOOLCHAIN),1)
+	docker run --rm --platform $(PLATFORM) \
+		-v "$(PWD)/plus-ui":/app -w /app \
+		$(TOOLCHAIN_IMG) bash -c '\
+			export PATH=/opt/ruyi/frontend-build/pnpm-standalone:/opt/ruyi/node/bin:$$PATH && \
+			pnpm install --frozen-lockfile --prefer-offline --store-dir /opt/ruyi/frontend-build/pnpm-store && \
+			pnpm build'
+else
+	docker run --rm \
+		-v "$(PWD)/plus-ui":/app -w /app \
+		-v "$(HOME)/.pnpm-store":/root/.local/share/pnpm/store \
+		$(NODE_IMG) bash -c 'corepack enable && corepack prepare pnpm@$(PNPM_VERSION) --activate && pnpm install --frozen-lockfile --registry=$(NPM_MIRROR) && pnpm build'
+endif
+
+# 容器化工具链版「能构建打包」验证（workflow ci-toolchain-img.yml / .gitea 内网流水线调用）
+ci-build-img: mvn-build-img images-backend $(CI_BUILD_IMG_EXTRA)
+	@echo "==> ci-build-img done"
+
+# ── 4) 本地集群工具（kubectl / k3d，幂等）────────────────────────
+setup-tools:
+	@command -v kubectl >/dev/null 2>&1 || { \
+		v=$$(curl -fsSL https://dl.k8s.io/release/stable.txt); \
+		echo "installing kubectl $$v"; \
+		curl -fsSL https://dl.k8s.io/release/$$v/bin/linux/amd64/kubectl -o /usr/local/bin/kubectl; \
+		chmod +x /usr/local/bin/kubectl; \
+	}
+	@command -v k3d >/dev/null 2>&1 || { \
+		echo "installing k3d"; \
+		curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash; \
+	}
+
+# ── 5) 起 k3d 集群 + 把本地镜像灌进集群（免 registry）────────────
+cluster-up: setup-tools
+	k3d cluster delete ruoyi-test >/dev/null 2>&1 || true   # 幂等：清掉上次残留再建
+	k3d cluster create ruoyi-test --wait
+	$(MAKE_CI) cluster-import
+
+cluster-import:
+	@imgs=""; for entry in $(MODULES); do imgs="$$imgs $${entry##*:}:$(TAG)"; done; \
+	if [ "$(SCOPE)" = "all" ]; then imgs="$$imgs ruoyi/plus-ui:$(TAG)"; fi; \
+	echo "==> importing into k3d:$$imgs"; \
+	k3d image import $$imgs -c ruoyi-test
+
+cluster-down:
+	k3d cluster delete ruoyi-test || true
+
+# ── 6) 部署清单（namespace + init SQL ConfigMap + 中间件 + 业务）──
+deploy:
+	kubectl apply -f script/k8s/namespace.yaml
+	kubectl -n $(NAMESPACE) create configmap mysql-init-sql \
+		--from-file=ry-cloud.sql=script/sql/ry-cloud.sql \
+		--from-file=ry-job.sql=script/sql/ry-job.sql \
+		--from-file=ry-ai.sql=script/sql/ry-ai.sql \
+		--from-file=ry-workflow.sql=script/sql/ry-workflow.sql \
+		--dry-run=client -o yaml | kubectl apply -f -
+	kubectl apply -f script/k8s/middleware/
+	@if [ "$(SCOPE)" = "minimal" ]; then \
+		kubectl apply -f script/k8s/backend/ruoyi-gateway.yaml \
+			-f script/k8s/backend/ruoyi-auth.yaml \
+			-f script/k8s/backend/ruoyi-system.yaml; \
+	else \
+		kubectl apply -f script/k8s/backend/ ; \
+		kubectl apply -f script/k8s/plus-ui/ ; \
+	fi
+
+# ── 7) 等待所有 Pod Ready ────────────────────────────────────────
+wait:
+	kubectl -n $(NAMESPACE) wait --for=condition=Ready pods --all --timeout=600s
+
+# ── 8) 验证服务间路由（port-forward 打 health + Nacos 注册列表）──
+verify:
+	@kubectl -n $(NAMESPACE) port-forward svc/nacos 8848:8848 & P1=$$!; \
+	 kubectl -n $(NAMESPACE) port-forward svc/ruoyi-gateway 8080:8080 & P2=$$!; \
+	 kubectl -n $(NAMESPACE) port-forward svc/ruoyi-system 9201:9201 & P3=$$!; \
+	 kubectl -n $(NAMESPACE) port-forward svc/ruoyi-auth 9210:9210 & P4=$$!; \
+	 sleep 12; \
+	 gw=$$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/actuator/health || true); \
+	 sys=$$(curl -s -o /dev/null -w '%{http_code}' http://localhost:9201/actuator/health || true); \
+	 au=$$(curl -s -o /dev/null -w '%{http_code}' http://localhost:9210/actuator/health || true); \
+	 echo "gateway/health=$$gw system/health=$$sys auth/health=$$au"; \
+	 echo "--- Nacos 服务列表（public）---"; \
+	 curl -s "http://localhost:8848/nacos/v3/console/services?namespaceId=public&groupName=DEFAULT_GROUP&pageNo=1&pageSize=100" \
+		| grep -o -E 'ruoyi-(system|auth|gateway)' | sort -u || echo "(Nacos API 路径可能随版本变化，未匹配不影响硬判定)"; \
+	 if [ "$$gw" = "200" ] && [ "$$sys" = "200" ] && [ "$$au" = "200" ]; then \
+		echo "OK 服务存活 + K8s 网络 + 应用健康 OK"; \
+	 else \
+		echo "FAIL 路由验证未通过（核心接口非 200）"; kill $$P1 $$P2 $$P3 $$P4 2>/dev/null; exit 1; \
+	 fi; \
+	 kill $$P1 $$P2 $$P3 $$P4 2>/dev/null || true
+
+# ── 9) 远端：推送镜像到 REGISTRY_PREFIX 并改写清单前缀 ────────────
+push-images:
+	@for entry in $(MODULES); do img=$${entry##*:}; \
+		docker tag $$img:$(TAG) $(REGISTRY_PREFIX)$$img:$(TAG); \
+		echo "push $(REGISTRY_PREFIX)$$img:$(TAG)"; \
+		docker push $(REGISTRY_PREFIX)$$img:$(TAG); \
+	done
+	@if [ "$(SCOPE)" = "all" ]; then \
+		docker tag ruoyi/plus-ui:$(TAG) $(REGISTRY_PREFIX)ruoyi/plus-ui:$(TAG); \
+		docker push $(REGISTRY_PREFIX)ruoyi/plus-ui:$(TAG); \
+	fi
+	find script/k8s -name '*.yaml' -exec sed -i "s#image: ruoyi/#image: $(REGISTRY_PREFIX)ruoyi/#g" {} +
+
+# ── 入口：本机 k3d 全流程（trap 兜底：无论成功失败都销毁集群）──────
+ci-deploy-local:
+	@trap '$(MAKE_CI) cluster-down' EXIT; \
+	$(MAKE_CI) ci-build cluster-up deploy wait verify
+
+# ── 入口：远端集群（推送 + apply + 验证，不清理远端集群）──────────
+ci-deploy-remote: ci-build push-images deploy wait verify
+	@echo "==> ci-deploy-remote done"

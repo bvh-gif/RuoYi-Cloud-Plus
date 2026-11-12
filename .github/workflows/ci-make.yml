@@ -1,0 +1,163 @@
+# ci-make.yml —— 用 Makefile.ci 驱动的 GitHub Actions 流水线
+#
+# 与 build-and-image*.yml / deploy-k8s.yml 的区别：
+#   那两份把逻辑内联在 workflow 的 run: 块里；本文件把领域逻辑下沉到 Makefile.ci，
+#   workflow 只负责「环境准备（actions）」+「调用 make 目标」——逻辑单一事实来源、本地可复用。
+#
+# 两个 job：
+#   build     （ubuntu-latest 云机，免自托管 runner）：make ci-build —— 验证「能构建打包镜像」
+#   deploy    （local→自托管 runner / remote→云机）：make ci-deploy-local | ci-deploy-remote —— 验证「部署+路由」
+#
+# 不挂 push/pr 自动触发：避免误发到集群，统一手动 workflow_dispatch 触发。
+
+name: ci-make
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "镜像标签（须与 pom <revision> 一致）"
+        required: false
+        default: "6.0.0"
+      platform:
+        description: "架构：linux/amd64（x86 原生免 QEMU）或 linux/arm64（对齐生产，需 QEMU 较慢）"
+        required: false
+        default: "linux/amd64"
+      deploy_scope:
+        description: "minimal=3 核心+中间件；all=全量 11 后端+前端"
+        required: false
+        default: "minimal"
+      k8s_target:
+        description: "local=本机 k3d（需自托管 runner）；remote=现成集群（需 KUBE_CONFIG secret）"
+        required: false
+        default: "local"
+      registry_prefix:
+        description: "远端仓库前缀（仅 remote），如 ghcr.io/<owner>/ 或 registry.cn-hangzhou.aliyuncs.com/<ns>/"
+        required: false
+        default: ""
+      frontend_repo:
+        description: "plus-ui 仓库地址（仅 SCOPE=all 用）"
+        required: false
+        default: "https://gitee.com/JavaLionLi/plus-ui.git"
+
+permissions:
+  contents: read
+  packages: write        # remote 走 GHCR 时需要
+
+jobs:
+  # ============================================================================
+  # 仅验证「能构建打包镜像」：跑在 GitHub 云机，免自托管 runner、免集群
+  # ============================================================================
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      TAG: ${{ inputs.tag || '6.0.0' }}
+      PLATFORM: ${{ inputs.platform || 'linux/amd64' }}
+      SCOPE: ${{ inputs.deploy_scope || 'minimal' }}
+      FRONTEND_REPO: ${{ inputs.frontend_repo || 'https://gitee.com/JavaLionLi/plus-ui.git' }}
+    steps:
+      - name: "检出代码"
+        uses: actions/checkout@v4
+
+      - name: "Set up JDK 21（Liberica）"
+        uses: actions/setup-java@v4
+        with:
+          distribution: "liberica"
+          java-version: "21"
+          cache: "maven"
+
+      - name: "生成 Maven settings.xml（阿里云公共镜像）"
+        env:
+          MAVEN_MIRROR: "https://maven.aliyun.com/repository/public"
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.m2
+          # 不用 heredoc：缩进的 EOF 终结符在 GHA run: 块里会被 bash 误判。
+          printf '<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"\n          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"\n          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0\n                              https://maven.apache.org/xsd/settings-1.0.0.xsd">\n  <mirrors>\n    <mirror>\n      <id>aliyun-public</id>\n      <name>Aliyun Public Mirror</name>\n      <url>%s</url>\n      <mirrorOf>*</mirrorOf>\n    </mirror>\n  </mirrors>\n</settings>\n' "$MAVEN_MIRROR" > ~/.m2/settings.xml
+          echo "=== settings.xml ==="; cat ~/.m2/settings.xml
+
+      - name: "Set up Node 22（仅 SCOPE=all 需要前端镜像）"
+        if: ${{ inputs.deploy_scope == 'all' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: "Set up Docker Buildx"
+        uses: docker/setup-buildx-action@v3
+
+      - name: "Set up QEMU（跨架构构建；原生架构可省略但无害）"
+        uses: docker/setup-qemu-action@v3
+
+      - name: "Ensure make"
+        run: command -v make >/dev/null 2>&1 || sudo apt-get update -y && sudo apt-get install -y make
+
+      - name: "编译 + 构建镜像（make ci-build）"
+        run: make -f Makefile.ci ci-build
+
+  # ============================================================================
+  # 验证「部署 + 服务间路由」：local 需自托管 runner（本机 k3d），remote 走云机
+  # ============================================================================
+  deploy:
+    runs-on: ${{ inputs.k8s_target == 'local' && 'self-hosted' || 'ubuntu-latest' }}
+    timeout-minutes: 180
+    env:
+      TAG: ${{ inputs.tag || '6.0.0' }}
+      PLATFORM: ${{ inputs.platform || 'linux/amd64' }}
+      SCOPE: ${{ inputs.deploy_scope || 'minimal' }}
+      K8S_TARGET: ${{ inputs.k8s_target || 'local' }}
+      REGISTRY_PREFIX: ${{ inputs.registry_prefix || format('ghcr.io/{0}/', github.repository_owner) }}
+      FRONTEND_REPO: ${{ inputs.frontend_repo || 'https://gitee.com/JavaLionLi/plus-ui.git' }}
+    steps:
+      - name: "检出代码"
+        uses: actions/checkout@v4
+
+      - name: "Set up JDK 21（Liberica）"
+        uses: actions/setup-java@v4
+        with:
+          distribution: "liberica"
+          java-version: "21"
+          cache: "maven"
+
+      - name: "生成 Maven settings.xml（阿里云公共镜像）"
+        env:
+          MAVEN_MIRROR: "https://maven.aliyun.com/repository/public"
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.m2
+          printf '<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"\n          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"\n          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0\n                              https://maven.apache.org/xsd/settings-1.0.0.xsd">\n  <mirrors>\n    <mirror>\n      <id>aliyun-public</id>\n      <name>Aliyun Public Mirror</name>\n      <url>%s</url>\n      <mirrorOf>*</mirrorOf>\n    </mirror>\n  </mirrors>\n</settings>\n' "$MAVEN_MIRROR" > ~/.m2/settings.xml
+          echo "=== settings.xml ==="; cat ~/.m2/settings.xml
+
+      - name: "Set up Node 22（仅 SCOPE=all 需要前端镜像）"
+        if: ${{ inputs.deploy_scope == 'all' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: "Set up Docker Buildx"
+        uses: docker/setup-buildx-action@v3
+
+      - name: "Set up QEMU（跨架构构建；原生架构可省略但无害）"
+        uses: docker/setup-qemu-action@v3
+
+      - name: "Ensure make"
+        run: command -v make >/dev/null 2>&1 || sudo apt-get update -y && sudo apt-get install -y make
+
+      - name: "远端：登录 GHCR + 写入 kubeconfig（仅 remote）"
+        if: ${{ inputs.k8s_target == 'remote' }}
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          echo "$KUBE_CONFIG" | base64 -d > /tmp/ruoyi-kubeconfig
+          echo "KUBECONFIG=/tmp/ruoyi-kubeconfig" >> "$GITHUB_ENV"
+
+      - name: "部署并验证（make ci-deploy-local / ci-deploy-remote）"
+        run: |
+          set -euo pipefail
+          if [ "$K8S_TARGET" = "local" ]; then
+            make -f Makefile.ci ci-deploy-local
+          else
+            make -f Makefile.ci ci-deploy-remote
+          fi

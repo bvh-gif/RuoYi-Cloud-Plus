@@ -1,0 +1,108 @@
+# .gitea/workflows/ci-backend.yml
+# 依据 ruoyi-mini 真实 Gitea Actions 流水线改写（结构 / 内部地址约定一致）。
+#
+# 与 mini 的关键对齐 / 改进：
+#   1) 复用公司 Gitea Actions 模式：内部 actions 代理、内部 JDK/Maven 文件服务器、内部 Nexus maven 源。
+#   2) 镜像发布沿用 mini 的「docker build → docker save tar → curl PUT 到 Nexus raw(controlled) 仓库」，
+#      而非 Harbor push（贵司当前 CI 实际未走 Harbor 推镜像，见下方 IMAGE_REPO_URL）。
+#   3) 多模块：根 reactor `mvn install` 后，循环为 11 个业务模块各自 build + 发布。
+#   4) JDK 升级到 21（RCP 要求）；架构保持 aarch64（与 mini / 公司运行时一致，非 amd64）。
+#   5) 安全改进：凭据改用 ${{ secrets.* }}，不再像 mini 那样硬编码 admin:123456（锚定 Prompt §五.2 禁止密钥入源码）。
+#
+# ⚠️ 已填入 mini(.gitea) 真实主机 32.61.79.150；若你环境用的是另一份(46.103.7.33)请改 host。
+# ⚠️ MAVEN_REPO_ID / IMAGE_REPO_ID 取自 mini(.gitea) 实际值；JDK 包名请核对文件服务器上的 JDK21 aarch64 实际文件名。
+
+name: "RCP 后端部署"
+on:
+  pull_request:
+  push:
+    branches: ["6.X", "docs/project-progress"]
+    paths-ignore:
+      - '.gitea/workflows/**'
+      - '.github/workflows/**'
+
+jobs:
+  build-deploy:
+    runs-on: 'ubuntu-latest'
+    env:
+      GITEA_ACTIONS_HOST: "http://32.61.79.150:30003"
+      FILE_HOST: "http://32.61.79.150:81"
+      NEXUS_HOST: "http://32.61.79.150:31080"
+      MAVEN_REPO_ID: "66306-relate-23bb91f468-maven"
+      IMAGE_REPO_ID: "66306-controlled-048a2fcc35-1"
+      IMAGE_TAG: "latest"
+
+    steps:
+      - name: "克隆代码"
+        uses: "http://32.61.79.150:30003/actions/checkout@v4"
+
+      - name: "下载 JDK 21 (aarch64)"
+        run: |
+          wget -O $RUNNER_TEMP/java_package.tar.gz "${FILE_HOST}/java_packages/jdk-21.0.24_linux-aarch64_bin.tar.gz"
+          # ↑ 文件名以文件服务器上实际的 JDK21 aarch64 包为准
+
+      - name: "setup-java（jdkfile，aarch64）"
+        uses: "http://32.61.79.150:30003/actions/setup-java@v4"
+        with:
+          distribution: 'jdkfile'
+          jdkFile: '${{ runner.temp }}/java_package.tar.gz'
+          java-version: '21'
+          architecture: 'aarch64'
+          cache: ''
+
+      - name: "安装 Maven（内部文件服务器）"
+        run: |
+          wget -O $RUNNER_TEMP/mvn_package.tar.gz "${FILE_HOST}/mvn/apache-maven-3.9.6-bin.tar.gz" && tar -zxvf $RUNNER_TEMP/mvn_package.tar.gz -C $RUNNER_TEMP
+
+      - name: "生成 settings.xml（内部 Nexus maven 源；凭据走 secrets，不硬编码）"
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+        run: |
+          echo "<settings><localRepository>./tmp-repo</localRepository><mirrors><mirror><id>zpk-maven</id><mirrorOf>*</mirrorOf><url>${NEXUS_HOST}/api/zpk/repository/${MAVEN_REPO_ID}</url></mirror></mirrors><servers><server><id>zpk-maven</id><username>${NEXUS_USER}</username><password>${NEXUS_PASS}</password></server></servers></settings>" > ./settings.xml
+          $RUNNER_TEMP/apache-maven-3.9.6/bin/mvn install -DskipTests -s ./settings.xml
+
+      - name: "逐个构建并发布 11 个业务镜像（docker save → Nexus tar）"
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+        run: |
+          set -euo pipefail
+          # 目录 -> 服务名；服务名决定镜像 ruoyi/ruoyi-<svc>。已补回 build-images.sh 漏掉的 ruoyi-gateway。
+          MODULES=(
+            "ruoyi-gateway:ruoyi-gateway"
+            "ruoyi-auth:ruoyi-auth"
+            "ruoyi-modules/ruoyi-system:ruoyi-system"
+            "ruoyi-modules/ruoyi-gen:ruoyi-gen"
+            "ruoyi-modules/ruoyi-job:ruoyi-job"
+            "ruoyi-modules/ruoyi-resource:ruoyi-resource"
+            "ruoyi-modules/ruoyi-workflow:ruoyi-workflow"
+            "ruoyi-modules/ruoyi-ai:ruoyi-ai"
+            "ruoyi-visual/ruoyi-monitor:ruoyi-monitor"
+            "ruoyi-visual/ruoyi-snailjob-server:ruoyi-snailjob-server"
+            "ruoyi-visual/ruoyi-snailai-server:ruoyi-snailai-server"
+          )
+          IMAGE_REPO_URL="${NEXUS_HOST}/api/zpk/repository/${IMAGE_REPO_ID}"
+          fail=0
+          for entry in "${MODULES[@]}"; do
+            dir="${entry%%:*}"; svc="${entry##*:}"
+            img="ruoyi/ruoyi-${svc}"
+            echo "==> build ${img}:${IMAGE_TAG} <- ${dir}"
+            if docker build -t "${img}:${IMAGE_TAG}" "./${dir}"; then
+              IMAGE_ID=$(docker images --format '{{.ID}}' "${img}:${IMAGE_TAG}" | tail -1)
+              IDENTIFIER=${IMAGE_ID:0:12}
+              TAR_NAME="${img}_${IDENTIFIER}.tar"
+              docker save "${img}:${IMAGE_TAG}" -o "${TAR_NAME}"
+              TIMESTAMP=$(TZ='Asia/Shanghai' date '+%Y%m%d_%H%M%S')
+              ARCHIVE_PATH="${img}/${TIMESTAMP}/${TAR_NAME}"
+              echo ">>> 上传 ${ARCHIVE_PATH}"
+              curl -u "${NEXUS_USER}:${NEXUS_PASS}" -X PUT -T "${TAR_NAME}" "${IMAGE_REPO_URL}/${ARCHIVE_PATH}"
+              rc=$?
+              docker image rm "${img}:${IMAGE_TAG}" || true
+              rm -f "${TAR_NAME}"
+              [ $rc -eq 0 ] || { echo "::error::上传失败 ${img}"; fail=$((fail+1)); }
+            else
+              echo "::error::构建失败 ${img}"; fail=$((fail+1))
+            fi
+          done
+          exit $fail

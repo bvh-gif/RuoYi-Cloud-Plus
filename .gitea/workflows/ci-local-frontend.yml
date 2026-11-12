@@ -1,0 +1,47 @@
+# .gitea/workflows/ci-local-frontend.yml
+# 【本地验证版】前端，不依赖公司内网供应链：
+#   - 不连内网 Nexus 拉 node_modules.tar.gz；直接 npm install（本机有 registry 访问时）或复用本地 node_modules
+#   - 镜像只在本地 docker 构建，不推 Nexus / 不推 Harbor
+# 适用：开发者在本机 / 自托管 runner（已装 node + Docker）上验证前端构建与镜像。
+# 纯本机无 runner：直接 npm run build + docker build 即可。
+#
+# 与内网版(ci-intranet-frontend.yml)区别：无内部 actions/Nexus 地址；无镜像发布步骤。
+
+name: "RCP 本地前端验证"
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '镜像标签（默认 6.0.0 以对齐 compose）'
+        default: '6.0.0'
+  push:
+    paths:
+      - "plus-ui/**"
+      - "ruoyi-ui/**"
+      - ".gitea/workflows/ci-local-frontend.yml"
+
+jobs:
+  build-verify:
+    runs-on: 'ubuntu-latest'
+    env:
+      FRONTEND_DIR: "plus-ui"        # 前端目录（按实际命名调整）
+      NODE_VERSION: "20"
+      IMAGE_TAG: "6.0.0"
+    steps:
+      - name: "克隆代码"
+        uses: "http://32.61.79.150:30003/actions/checkout@v4"
+
+      - name: "setup-node（内部 actions）"
+        uses: "http://32.61.79.150:30003/actions/setup-node@master"
+        with:
+          node-version: '${{ env.NODE_VERSION }}'
+
+      - name: "构建前端（优先复用本地 node_modules，否则 install）"
+        run: |
+          cd ${FRONTEND_DIR}
+          if [ -d node_modules ]; then echo "复用现有 node_modules"; else npm install; fi
+          npm run build
+
+      - name: "本地构建前端镜像"
+        run: |
+          docker build -t "ruoyi/ruoyi-web:${IMAGE_TAG}" "${FRONTEND_DIR}"

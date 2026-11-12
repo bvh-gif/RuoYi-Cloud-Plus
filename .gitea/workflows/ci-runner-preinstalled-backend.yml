@@ -1,0 +1,151 @@
+# .gitea/workflows/ci-runner-preinstalled-backend.yml
+# 【Runner 预装】工具供给方式 · 内网 Gitea 实例 后端流水线
+#
+# ── 工具供给方式 = Runner 预装（镜像供给）──
+#   内网【不能修改 runner 操作系统】，工具烤进 ruoyi/ci-toolchain:TAG 镜像
+#   （JDK+Maven+Node+离线 Maven 仓库+pnpm store 全烤进去，见 runner/Dockerfile），
+#   事先 docker load 到 runner 服务器；流水线用 docker run 调它做编译。
+#
+# ── 本流水线职责（领域逻辑全部下沉到 Makefile.ci）──
+#   1) 校验 TAG 与 offline-arm-bundle/VERSIONS.env 的 RUOYI_REVISION 一致；
+#   2) 确认工具镜像 ruoyi/ci-toolchain:TAG 已 docker load 到 runner 服务器；
+#   3) 确认 docker build 基础镜像（JDK_IMAGE）已就位（缺失则尝试 REGISTRY_HOST 回退）；
+#   4) 调 make -f Makefile.ci ci-build-img PLATFORM=linux/arm64 USE_TOOLCHAIN=1
+#      —— 工具链镜像内跑 mvn -o（离线仓库烤入镜像）编译 + docker buildx 构建 11 后端镜像；
+#   5) 逐个 docker save → curl PUT 到 Nexus raw 仓（内网镜像分发）。
+#   编译/镜像构建不落主机、不下载工具；仅「调用已加载的工具镜像 + 发布产物」。
+#
+# ── 与同目录其它文件 ──
+#   ci-runner-preinstalled-frontend.yml = 同方式的【前端】独立流水线（调 Makefile.ci frontend-build-img）；
+#   back.yml / ci-intranet-backend.yml = 历史/其它内网实现（mini 改写 / 完全离线），择一维护避免漂移；
+#   包供给（工具以 actions 装、依赖在线拉）仅保留在联网 GitHub 环境 → .github/workflows/ci-package-backend.yml。
+#
+# 参考：ruoyi-mini 流水线（已跑通）、runner/Dockerfile、script/ci-toolchain-image.sh、Makefile.ci
+
+name: "RCP 后端·Runner 预装"
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '镜像 TAG（须等于 offline-arm-bundle/VERSIONS.env 的 RUOYI_REVISION）'
+        required: false
+        default: '6.0.0'
+  push:
+    branches: ["6.X", "docs/project-progress"]
+    paths-ignore:
+      - '.gitea/workflows/**'
+      - '.github/workflows/**'
+
+jobs:
+  build-deploy:
+    runs-on: 'ubuntu-latest'   # 指向已加载 ruoyi/ci-toolchain + 各基础镜像的 runner 服务器（arm64）
+    env:
+      # —— 统一标识符（内网才有，临时用示例值填充；接入时改 env 即可）——
+      GITEA_ACTIONS_HOST: "http://32.61.79.150:30003"
+      NEXUS_HOST: "http://32.61.79.150:31080"
+      IMAGE_REPO_ID: "66306-controlled-048a2fcc35-1"
+      REGISTRY_HOST: "registry.internal:5000"
+      TAG: ${{ inputs.tag }}
+      # 已烤好工具链的镜像（ruoyi/ci-toolchain:TAG），须事先 docker load 到本 runner 服务器
+      TOOL_IMAGE: "ruoyi/ci-toolchain:${{ inputs.tag }}"
+      # 凭据走 secrets（不硬编码）
+      NEXUS_USER: ${{ secrets.NEXUS_USER }}
+      NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+
+    steps:
+      - name: "克隆代码"
+        uses: "http://32.61.79.150:30003/actions/checkout@v4"
+
+      - name: "版本一致性校验（TAG 须等于 VERSIONS.env 的 RUOYI_REVISION）"
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          [ -f "$GITHUB_WORKSPACE/offline-arm-bundle/VERSIONS.env" ] && . "$GITHUB_WORKSPACE/offline-arm-bundle/VERSIONS.env"
+          set +a
+          if [ "${{ inputs.tag }}" != "${RUOYI_REVISION}" ]; then
+            echo "✗ TAG 不一致：workflow 输入 ${{ inputs.tag }} ≠ VERSIONS.env 的 ${RUOYI_REVISION}。"; exit 1
+          fi
+          echo "✓ 版本一致"
+
+      - name: "确认工具镜像已加载（Runner 预装：镜像须事先 docker load 到 runner 服务器）"
+        shell: bash
+        run: |
+          set -euo pipefail
+          if docker image inspect "$TOOL_IMAGE" >/dev/null 2>&1; then
+            echo "工具镜像已加载：$TOOL_IMAGE"
+          else
+            echo "::error::$TOOL_IMAGE 未加载。请先在 runner 服务器 docker load ruoyi/ci-toolchain:$TAG（见 script/ci-toolchain-image.sh 与 runner/Dockerfile）。"
+            exit 1
+          fi
+
+      - name: "确保 docker build 基础镜像（JDK_IMAGE）已加载（业务 Dockerfile 的 FROM）"
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          [ -f "$GITHUB_WORKSPACE/offline-arm-bundle/VERSIONS.env" ] && . "$GITHUB_WORKSPACE/offline-arm-bundle/VERSIONS.env"
+          set +a
+          IMG="${JDK_IMAGE}"
+          if docker image inspect "$IMG" >/dev/null 2>&1; then
+            echo "base image present: $IMG"
+          else
+            echo "::warning::$IMG 未加载，尝试 REGISTRY_HOST 回退拉取。"
+            docker pull "${REGISTRY_HOST}/${IMG}" && docker tag "${REGISTRY_HOST}/${IMG}" "$IMG" || {
+              echo "::error::$IMG 未加载且无法拉取。请 docker load build-base-images.tar 到 runner 服务器。"; exit 1
+            }
+          fi
+
+      - name: "Ensure make（runner 可能未预装）"
+        shell: bash
+        run: command -v make >/dev/null 2>&1 || { sudo apt-get update -y && sudo apt-get install -y make; }
+
+      - name: "后端编译 + 构建 11 镜像（make ci-build-img：工具链镜像内跑 mvn -o，离线）"
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          # 领域逻辑全部在 Makefile.ci：mvn-build-img（USE_TOOLCHAIN=1 → 工具链镜像内 mvn -o）+ images-backend（docker buildx）
+          make -f Makefile.ci ci-build-img \
+            TAG="${{ inputs.tag }}" \
+            PLATFORM=linux/arm64 \
+            USE_TOOLCHAIN=1
+
+      - name: "逐个发布 11 个业务镜像（docker save → Nexus raw tar；镜像已由 make 构建）"
+        shell: bash
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+        run: |
+          set -euo pipefail
+          RUOYI_MODULES=()
+          set -a
+          [ -f "$GITHUB_WORKSPACE/offline-arm-bundle/VERSIONS.env" ] && . "$GITHUB_WORKSPACE/offline-arm-bundle/VERSIONS.env"
+          [ -f "$GITHUB_WORKSPACE/offline-arm-bundle/MODULES.env" ] && . "$GITHUB_WORKSPACE/offline-arm-bundle/MODULES.env"
+          set +a
+          cd "$GITHUB_WORKSPACE"
+          IMAGE_REPO_URL="${NEXUS_HOST}/api/zpk/repository/${IMAGE_REPO_ID}"
+          MODULES=("${RUOYI_MODULES[@]}")
+          IMG_ID=$(head -c12 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c12)
+          RUN_TS=$(TZ='Asia/Shanghai' date '+%Y%m%d_%H%M%S')
+          fail=0
+          for entry in "${MODULES[@]}"; do
+            image="${entry##*:}"; name="${image#ruoyi/}"
+            echo "=============================================================="
+            echo "publish $image:$TAG"
+            echo "=============================================================="
+            if docker image inspect "$image:$TAG" >/dev/null 2>&1; then
+              TAR="ruoyi-${name}_${IMG_ID}.tar"
+              docker save "$image:$TAG" -o "$TAR"
+              ARCHIVE_PATH="${image}/${RUN_TS}/${TAR}"
+              echo ">>> 上传 ${ARCHIVE_PATH}"
+              curl -fsSL -u "$NEXUS_USER:$NEXUS_PASS" -X PUT -T "$TAR" "${IMAGE_REPO_URL}/${ARCHIVE_PATH}"
+              rm -f "$TAR"
+            else
+              echo "FAIL $image:$TAG 未构建（make 应已产出）"; fail=$((fail + 1))
+            fi
+          done
+          echo "BUILT_FAIL=$fail" >> "$GITHUB_ENV"
+          [ "$fail" -eq 0 ]

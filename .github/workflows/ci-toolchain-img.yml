@@ -1,0 +1,66 @@
+# ci-toolchain-img.yml —— 容器化工具链流水线
+#
+# 与 ci-make.yml 的核心区别：编译工具链（JDK / Maven / Node）不再由 runner 预装
+# （不再有 setup-java / setup-node / pnpm-action），而是由镜像在容器内提供——
+# 领域逻辑下沉到 Makefile.ci 的 mvn-build-img / frontend-build-img / ci-build-img target。
+# 本 workflow 只负责「准备 Docker（buildx / QEMU / make）」+「调用 make」。
+#
+# 价值：
+#   - 编译期 JDK/Maven/Node 版本与 offline-arm-bundle/VERSIONS.env 单一真相源对齐，runner 环境零漂移；
+#   - 本地 WSL2+Docker 可直接 `make -f Makefile.ci ci-build-img` 1:1 复现；
+#   - 内网离线 / 多架构对齐场景只需替换 MVN_IMG / NODE_IMG（命令行覆盖即可）。
+#
+# 不挂 push/pr 自动触发，统一手动 workflow_dispatch，避免误发大量构建。
+
+name: ci-toolchain-img
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "镜像标签（须与 pom <revision> 一致）"
+        required: false
+        default: "6.0.0"
+      platform:
+        description: "架构：linux/amd64（x86 原生免 QEMU）或 linux/arm64（对齐生产，需 QEMU）"
+        required: false
+        default: "linux/amd64"
+      deploy_scope:
+        description: "minimal=3 核心+中间件；all=全量 11 后端+前端"
+        required: false
+        default: "minimal"
+      frontend_repo:
+        description: "plus-ui 仓库地址（仅 SCOPE=all 用）"
+        required: false
+        default: "https://gitee.com/JavaLionLi/plus-ui.git"
+
+permissions:
+  contents: read
+
+jobs:
+  # ============================================================================
+  # 编译 + 构建镜像：工具链在镜像内，runner 只出 Docker + make
+  # ============================================================================
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      TAG: ${{ inputs.tag || '6.0.0' }}
+      PLATFORM: ${{ inputs.platform || 'linux/amd64' }}
+      SCOPE: ${{ inputs.deploy_scope || 'minimal' }}
+      FRONTEND_REPO: ${{ inputs.frontend_repo || 'https://gitee.com/JavaLionLi/plus-ui.git' }}
+    steps:
+      - name: "检出代码"
+        uses: actions/checkout@v4
+
+      - name: "Set up Docker Buildx"
+        uses: docker/setup-buildx-action@v3
+
+      - name: "Set up QEMU（跨架构构建；原生架构可省略但无害）"
+        uses: docker/setup-qemu-action@v3
+
+      - name: "Ensure make"
+        run: command -v make >/dev/null 2>&1 || sudo apt-get update -y && sudo apt-get install -y make
+
+      - name: "编译 + 构建镜像（容器化工具链：make ci-build-img）"
+        run: make -f Makefile.ci ci-build-img

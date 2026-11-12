@@ -1,0 +1,72 @@
+# .gitea/workflows/ci-intranet-frontend.yml
+# 【内网迁入版】依据 ruoyi-mini 真实前端 Gitea Actions 流水线改写。
+#
+# 当前状态：RCP 仓库尚未纳入 plus-ui / ruoyi-ui 前端目录（见 docs/deployment-completion-assessment.md 缺口 D）。
+# 本文件已按 mini 前端模式写好，待前端目录落入仓库后启用即可。
+#
+# mini 前端模式：内部 actions 代理 → setup-node → 从 Nexus 拉 node_modules.tar.gz（离线依赖）→ npm run build
+#            → docker build（前端 Dockerfile + nginx.conf）→ docker save tar → curl PUT 到 Nexus controlled 仓库。
+# 镜像发布同样走 Nexus raw tar（非 Harbor），与后端一致。
+
+name: "RCP 内网前端发布"
+on:
+  push:
+    branches: ["6.X", "docs/project-progress"]
+    paths:
+      - "plus-ui/**"
+      - "ruoyi-ui/**"
+      - ".gitea/workflows/ci-intranet-frontend.yml"
+  workflow_dispatch:
+
+jobs:
+  build-deploy:
+    runs-on: 'ubuntu-latest'
+    env:
+      GITEA_ACTIONS_HOST: "http://32.61.79.150:30003"
+      NEXUS_HOST: "http://32.61.79.150:31080"
+      MAVEN_REPO_ID: "66306-relate-23bb91f468-maven"   # 前端 node_modules.tar.gz 所在仓库（同后端或另建前端依赖仓库）
+      IMAGE_REPO_ID: "66306-controlled-048a2fcc35-1"
+      FRONTEND_DIR: "plus-ui"                            # 前端目录（按实际命名调整：plus-ui / ruoyi-ui）
+      NODE_VERSION: "20"
+      IMAGE_TAG: "latest"
+
+    steps:
+      - name: "克隆代码"
+        uses: "http://32.61.79.150:30003/actions/checkout@v4"
+
+      - name: "setup-node（内部 actions）"
+        uses: "http://32.61.79.150:30003/actions/setup-node@master"
+        with:
+          node-version: '${{ env.NODE_VERSION }}'
+
+      - name: "拉取离线依赖 node_modules.tar.gz（Nexus）"
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+        run: |
+          wget -O node_modules.tar.gz "${NEXUS_HOST}/api/zpk/repository/${MAVEN_REPO_ID}/node_modules.tar.gz"
+          tar -zxvf node_modules.tar.gz -C ${FRONTEND_DIR}
+
+      - name: "构建前端"
+        run: |
+          cd ${FRONTEND_DIR}
+          npm install --offline || npm install --prefer-offline
+          npm run build
+
+      - name: "构建并发布前端镜像（docker save → Nexus tar）"
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+        run: |
+          set -euo pipefail
+          img="ruoyi/ruoyi-web"
+          docker build -t "${img}:${IMAGE_TAG}" "${FRONTEND_DIR}"
+          IMAGE_ID=$(docker images --format '{{.ID}}' "${img}:${IMAGE_TAG}" | tail -1)
+          IDENTIFIER=${IMAGE_ID:0:12}
+          TAR_NAME="${img}_${IDENTIFIER}.tar"
+          docker save "${img}:${IMAGE_TAG}" -o "${TAR_NAME}"
+          TIMESTAMP=$(TZ='Asia/Shanghai' date '+%Y%m%d_%H%M%S')
+          ARCHIVE_PATH="${img}/${TIMESTAMP}/${TAR_NAME}"
+          curl -u "${NEXUS_USER}:${NEXUS_PASS}" -X PUT -T "${TAR_NAME}" "${NEXUS_HOST}/api/zpk/repository/${IMAGE_REPO_ID}/${ARCHIVE_PATH}"
+          docker image rm "${img}:${IMAGE_TAG}" || true
+          rm -f "${TAR_NAME}"

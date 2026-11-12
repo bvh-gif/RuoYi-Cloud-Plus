@@ -1,0 +1,193 @@
+# RuoYi-Cloud-Plus 后端流水线（Gitea Actions）
+# 场景：内网离线 ARM(aarch64) DevOps，构建机只有 Docker daemon + 基础 Linux（无 JDK/Maven/Node）。
+#
+# 与 ruoyi-mini 后端流水线代码.yaml 的关系 / 关键改造：
+#   1) JDK 不靠宿主安装（离线装不上）。复用 bellsoft/liberica-openjdk-rocky:21.0.12-cds 镜像，
+#      把「源码 + Maven 工具 + 离线仓库」挂进该容器跑 `mvn -o clean install`，产物 jar 落回宿主。
+#   2) ruoyi-mini 的 ruoyi_back 只有 pom.xml + src，【没有 Dockerfile】，
+#      所以它的流水线用 `cat > Dockerfile <<'EOF'`（FROM microservices-java:1.0.0）内联生成；
+#      本仓库每个业务模块【自带 Dockerfile】（FROM bellsoft，ADD ./target/ruoyi-*.jar ./app.jar），
+#      因此【不需要】内联生成，直接 `docker build` 现有 Dockerfile 即可。
+#   3) 本仓库有 11 个业务模块（见下方 MODULES），需逐个 build 成 ruoyi/ruoyi-*:6.0.0；
+#      ruoyi-mini 只有一个后端 jar，结构更简单。
+#
+# Nexus 地址：对齐公司模板（ci-backend.yml / docs/ci-pipeline-design-and-verification.md），
+# 用「指定标识符」拼接，不再用单一 NEXUS_URL：
+#   NEXUS_HOST + MAVEN_REPO_ID -> 构建依赖仓（maven 分发 / repository.zip / node / pnpm 等离线包）
+#   NEXUS_HOST + IMAGE_REPO_ID -> controlled 镜像仓（build-base-images.tar 回退拉取 / 11 镜像 tar 上传）
+#   URL = ${NEXUS_HOST}/api/zpk/repository/${REPO_ID}
+# 凭据 NEXUS_USER / NEXUS_PASS 走 secrets（与模板一致，不硬编码）。
+#
+# 两种物料来源：
+#   [A] 离线预置：IMPORT-MANIFEST.md 的一键导入已把 Maven/仓库铺到 /opt/ruyi 并 docker load 好镜像。
+#   [B] Nexus 回退：预置缺失时，从上方指定标识符对应的 Nexus 仓 curl 拉取再解压 / docker load。
+#
+# 触发：手动 workflow_dispatch（可改 push 到指定分支）。
+name: build-backend
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '镜像 TAG（须等于 offline-arm-bundle/VERSIONS.env 的 RUOYI_REVISION；不一致将被「版本一致性校验」拦截）'
+        required: false
+        default: '6.0.0'
+
+jobs:
+  job1:
+    # 内网 DevOps runner 标签即为 ubuntu-latest，且机器实为 arm64 原生 —— 直接使用即可。
+    # 本仓库镜像全是 arm64，docker build 已带 --platform $TARGET_ARCH（=linux/arm64）锁定架构；
+    # 若将来迁到 x86 runner，需开启 buildx+QEMU，否则构建产物会报 exec format error。
+    runs-on: 'ubuntu-latest'
+    env:
+      # —— 指定标识符（与模板 ci-backend.yml 一致，非密）——
+      GITEA_ACTIONS_HOST: "http://32.61.79.150:30003"
+      NEXUS_HOST: "http://32.61.79.150:31080"
+      MAVEN_REPO_ID: "66306-relate-23bb91f468-maven"   # 构建依赖仓（maven 分发 / repository.zip / node / pnpm 等离线包）
+      IMAGE_REPO_ID: "66306-controlled-048a2fcc35-1"    # controlled 镜像仓（build-base-images.tar + 11 镜像 tar）
+      FILE_HOST: "http://32.61.79.150:81"               # 与模板对齐；离线场景未直接使用
+      TAG: ${{ inputs.tag }}
+      # —— 凭据走 secrets（与模板一致，不硬编码）——
+      NEXUS_USER: ${{ secrets.NEXUS_USER }}
+      NEXUS_PASS: ${{ secrets.NEXUS_PASS }}
+    steps:
+      - name: "检出代码"
+        uses: "http://32.61.79.150:30003/actions/checkout@v4"
+
+      - name: "版本一致性校验（TAG 须等于 VERSIONS.env 的 RUOYI_REVISION）"
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          [ -f "$GITHUB_WORKSPACE/offline-arm-bundle/VERSIONS.env" ] && . "$GITHUB_WORKSPACE/offline-arm-bundle/VERSIONS.env"
+          set +a
+          echo "inputs.tag=${{ inputs.tag }}  RUOYI_REVISION=${RUOYI_REVISION:-<未定义>}"
+          if [ "${{ inputs.tag }}" != "${RUOYI_REVISION}" ]; then
+            echo "✗ TAG 不一致：workflow 输入 ${{ inputs.tag }} ≠ VERSIONS.env 的 ${RUOYI_REVISION}。"
+            echo "  请同步两者（单一真相源：offline-arm-bundle/VERSIONS.env）。"
+            exit 1
+          fi
+          echo "✓ 版本一致"
+
+      - name: "准备 Maven 工具链（[A] 预置优先 / [B] Nexus 回退）"
+        id: maven
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          [ -f "$GITHUB_WORKSPACE/offline-arm-bundle/VERSIONS.env" ] && . "$GITHUB_WORKSPACE/offline-arm-bundle/VERSIONS.env"
+          set +a
+          MAVEN_REPO_URL="${NEXUS_HOST}/api/zpk/repository/${MAVEN_REPO_ID}"
+          MVN_DIR=/opt/ruyi/maven
+          mkdir -p "$MVN_DIR"
+
+          # [A] 预置路径已存在则直接复用
+          if [ -x "$MVN_DIR/apache-maven-${MAVEN_VERSION}/bin/mvn" ]; then
+            echo "use pre-staged maven binary"
+          else
+            # [B] 从指定标识符对应的 Maven 仓拉分发（架构无关，tar.gz 即可用）
+            curl -fsSL -u "$NEXUS_USER:$NEXUS_PASS" \
+              "$MAVEN_REPO_URL/apache-maven-${MAVEN_VERSION}-bin.tar.gz" -o /tmp/mvn.tgz
+            tar xzf /tmp/mvn.tgz -C "$MVN_DIR"
+          fi
+
+          # 离线仓库：预置 repository/ 优先，否则拉 repository.zip（3.9G，小文件过多打成 zip）
+          if [ -d "$MVN_DIR/repository" ] && [ "$(find "$MVN_DIR/repository" -type f 2>/dev/null | wc -l)" -gt 1000 ]; then
+            echo "use pre-staged maven repository"
+          else
+            curl -fsSL -u "$NEXUS_USER:$NEXUS_PASS" \
+              "$MAVEN_REPO_URL/maven-repository.zip" -o /tmp/repo.zip
+            # 无 unzip 时改用：python3 -m zipfile -e /tmp/repo.zip "$MVN_DIR"/
+            unzip -q /tmp/repo.zip -d "$MVN_DIR"/
+          fi
+
+          # 清掉可能残留的仓库来源标记，否则离线 mvn -o 会报
+          # "... has not been downloaded from it before"（即使 jar 明明存在）
+          find "$MVN_DIR/repository" \( -name '_remote.repositories' -o -name '*.lastUpdated' \) -delete
+
+          echo "MVN_HOME=$MVN_DIR/apache-maven-${MAVEN_VERSION}" >> "$GITHUB_ENV"
+          echo "REPO_DIR=$MVN_DIR/repository" >> "$GITHUB_ENV"
+
+      - name: "预检 / 加载基础镜像 bellsoft（编译 + 运行时 JDK）"
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          [ -f "$GITHUB_WORKSPACE/offline-arm-bundle/VERSIONS.env" ] && . "$GITHUB_WORKSPACE/offline-arm-bundle/VERSIONS.env"
+          set +a
+          IMAGE_REPO_URL="${NEXUS_HOST}/api/zpk/repository/${IMAGE_REPO_ID}"
+          IMG=${JDK_IMAGE}
+          if docker image inspect "$IMG" >/dev/null 2>&1; then
+            echo "base image already loaded: $IMG"
+          else
+            # [B] 镜像未 load 时从指定标识符对应的镜像仓拉 build-base-images.tar 再 load
+            curl -fsSL -u "$NEXUS_USER:$NEXUS_PASS" \
+              "$IMAGE_REPO_URL/build-base-images.tar" -o /tmp/base.tar
+            docker load -i /tmp/base.tar
+          fi
+
+      - name: "后端编译（在 bellsoft 容器内 mvn -o clean install → 49 个 jar）"
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          [ -f "$GITHUB_WORKSPACE/offline-arm-bundle/VERSIONS.env" ] && . "$GITHUB_WORKSPACE/offline-arm-bundle/VERSIONS.env"
+          set +a
+          SRC="$GITHUB_WORKSPACE"
+          docker run --rm --platform $TARGET_ARCH --network=none \
+            -v "$SRC:/src" \
+            -v "$MVN_HOME:/opt/maven" \
+            -v "$REPO_DIR:/opt/repo" \
+            -e MAVEN_OPTS="-Xmx2g" \
+            ${JDK_IMAGE} \
+            bash -c '
+              set -e
+              cd /src
+              # 严禁 ./mvnw：wrapper 首次会联网下载分发。离线只能用解压出的 mvn 二进制。
+              # -o 禁止联网，缺一个 jar 立即失败 = 离线验收。
+              /opt/maven/bin/mvn -o -DskipTests -Dmaven.repo.local=/opt/repo clean install
+            '
+          echo "compile done; jars produced:"
+          ls -1 "$SRC"/*/target/*.jar 2>/dev/null | wc -l
+
+      - name: "逐个构建 11 个业务镜像（沿用模块自带 Dockerfile，无需内联生成）"
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUOYI_MODULES=()   # 防御：MODULES.env 缺失时置空数组，避免 set -u 下未绑定报错
+          set -a
+          [ -f "$GITHUB_WORKSPACE/offline-arm-bundle/VERSIONS.env" ] && . "$GITHUB_WORKSPACE/offline-arm-bundle/VERSIONS.env"
+          [ -f "$GITHUB_WORKSPACE/offline-arm-bundle/MODULES.env" ] && . "$GITHUB_WORKSPACE/offline-arm-bundle/MODULES.env"
+          set +a
+          cd "$GITHUB_WORKSPACE"
+          IMAGE_REPO_URL="${NEXUS_HOST}/api/zpk/repository/${IMAGE_REPO_ID}"
+          # 模块目录 -> 镜像名（单一真相源：offline-arm-bundle/MODULES.env 的 RUOYI_MODULES）
+          # 注意：compose 里虽引用 ruoyi/ruoyi-demo，但 MODULES 不含它，流水线永不产出，切勿补 build。
+          MODULES=("${RUOYI_MODULES[@]}")
+          # 12 位随机 ID + 时间戳子目录（对齐模板的 imageName_<12charID>.tar 命名）
+          IMG_ID=$(head -c12 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c12)
+          RUN_TS=$(TZ='Asia/Shanghai' date '+%Y%m%d_%H%M%S')
+          fail=0
+          for entry in "${MODULES[@]}"; do
+            dir="${entry%%:*}"
+            image="${entry##*:}"
+            name="${image#ruoyi/}"            # 文件名去掉 ruoyi/ 前缀
+            echo "=============================================================="
+            echo "build $image:$TAG  <- $dir"
+            echo "=============================================================="
+            if docker build --platform $TARGET_ARCH --network=none -t "$image:$TAG" "./$dir"; then
+              # 保存并上传到 controlled 镜像仓（命名/路径对齐模板：镜像名/时间戳/镜像名_<12位ID>.tar）
+              TAR="ruoyi-${name}_${IMG_ID}.tar"
+              docker save "$image:$TAG" -o "$TAR"
+              ARCHIVE_PATH="${image}/${RUN_TS}/${TAR}"
+              echo ">>> 上传 ${ARCHIVE_PATH}"
+              curl -fsSL -u "$NEXUS_USER:$NEXUS_PASS" -X PUT -T "$TAR" \
+                "${IMAGE_REPO_URL}/${ARCHIVE_PATH}"
+              rm -f "$TAR"
+            else
+              echo "FAIL $image"
+              fail=$((fail + 1))
+            fi
+          done
+          echo "BUILT_FAIL=$fail" >> "$GITHUB_ENV"
+          [ "$fail" -eq 0 ]

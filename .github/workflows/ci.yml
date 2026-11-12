@@ -1,0 +1,138 @@
+# RuoYi-Cloud-Plus CI
+#
+# ── 为什么选 ubuntu-latest ──────────────────────────────────────────
+# 1. 预装原生 Docker（dockerd），没有 Docker Desktop 那层路径翻译
+#    → RUOYI_DATA_ROOT 就是普通 Linux 路径，不需要任何盘符/WSL 形态转换。
+# 2. network_mode: host 在原生 Linux 下语义是「runner 自己就是宿主机」
+#    → runner 里 curl 127.0.0.1:8080 直接通。
+#    （这一点比本机 Windows Docker Desktop 还简单：本机的 host 网络连的是
+#      docker-desktop 隐藏发行版，浏览器/WSL 都够不着。）
+# 3. x64 → mysql / redis / nacos / liberica 基础镜像都有 amd64 变体。
+#
+# 公共仓库 ubuntu-latest = 4 vCPU / 16GB；私有仓库只有 2 vCPU / 8GB
+# → 全栈冒烟只用 minimal 档（约 4.7GB），不要跑 full（约 12GB）。
+#
+# ── 已知坑（首次运行大概率要迭代这几处）──────────────────────────────
+# a. .mvn/wrapper 的 distributionUrl 与 pom 的 public 仓库都指向华为云镜像。
+#    GitHub runner 在 Azure（境外），访问华为云可能慢或不通。
+#    若构建卡在下载，改用 actions/setup-java 自带的 Maven 并配 Maven Central。
+# b. 未挂 docker-compose.local.yml（CI 上不需要它解决的路径漂移问题），
+#    因此 Nacos 走镜像默认配置（Derby 存储）。若镜像默认开启了鉴权，
+#    nacos-config-import.sh 的 bootstrap 流程仍可用，但需实测确认。
+# c. runner 磁盘只有 14GB SSD。11 个业务镜像全构建约 8.8GB 会撑爆
+#    → 冒烟只构建 minimal 需要的 3 个，并在构建后 prune。
+# d. 本机 bootstrap.sh 的 compose 链硬编码包含 .local 层，CI 用不了，
+#    故这里显式列出 compose 文件，不复用 bootstrap.sh。
+#
+# ⚠️ 本文件尚未在 GitHub Actions 上实测过，属于「可执行的设计稿」。
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 只在 CI 存活的临时值；可在仓库 Settings → Secrets 覆盖
+  NACOS_PASS: ${{ secrets.NACOS_ADMIN_PASSWORD || 'nacos-ci-only' }}
+  JAVA_VERSION: '21'
+
+jobs:
+
+  # ── 1. 构建 ────────────────────────────────────────────────────────
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Maven 构建（跳过测试）
+        run: ./mvnw -B -ntp clean install -DskipTests
+
+  # ── 2. 全栈冒烟（最小集）────────────────────────────────────────────
+  smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # 低资源档：3 个业务服务 + 基础设施，实测约 4.7GB
+      RUOYI_JVM_XMX: 512m
+      RUOYI_JVM_XMX_HEAVY: 640m
+      CF: >-
+        -f script/docker/docker-compose.yml
+        -f script/docker/docker-compose.health.yml
+        -f script/docker/docker-compose.mem.yml
+        -f script/docker/docker-compose.nacos-noauth.yml
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: 构建 minimal 需要的 3 个镜像
+        run: |
+          ./mvnw -B -ntp clean install -DskipTests -pl ruoyi-gateway,ruoyi-auth,ruoyi-modules/ruoyi-system -am
+          for m in gateway auth system; do
+            docker build -t "ruoyi/ruoyi-${m}:6.0.0" "ruoyi-${m}" || exit 1
+          done
+          docker system prune -f
+
+      - name: 起基础设施
+        run: docker compose $CF up -d mysql redis nacos
+
+      - name: 等 Nacos 健康
+        run: |
+          for i in $(seq 1 60); do
+            s=$(docker inspect -f '{{.State.Health.Status}}' nacos 2>/dev/null)
+            [ "$s" = "healthy" ] && exit 0
+            sleep 5
+          done
+          docker logs --tail 100 nacos
+          exit 1
+
+      - name: 建库导表
+        run: |
+          for db in ry-cloud ry-job ry-ai ry-workflow; do
+            docker exec mysql mysql -uroot -p'ruoyi123' \
+              -e "CREATE DATABASE IF NOT EXISTS \`$db\` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
+          done
+          docker exec -i mysql mysql -uroot -p'ruoyi123' --default-character-set=utf8mb4 ry-cloud < script/sql/ry-cloud.sql
+
+      - name: bootstrap Nacos 管理员并导入配置
+        run: |
+          docker exec nacos curl -s --max-time 15 -X POST \
+            'http://127.0.0.1:8848/nacos/v3/auth/user/admin' \
+            -d "password=${NACOS_PASS}" | tee /tmp/boot.json
+          grep -q '"code":0' /tmp/boot.json || echo "（可能已存在管理员，继续）"
+          NACOS_USER=nacos ./script/nacos-config-import.sh
+
+      - name: 起最小集
+        run: docker compose $CF up -d ruoyi-gateway ruoyi-auth ruoyi-system
+
+      - name: 等待并验收
+        run: |
+          sleep 60
+          RUOYI_VERIFY_SERVICES="ruoyi-gateway ruoyi-auth ruoyi-system" ./script/verify-stack.sh
+
+      - name: 失败时收集日志
+        if: failure()
+        run: |
+          docker compose $CF ps
+          for c in nacos mysql ruoyi-gateway ruoyi-auth ruoyi-system; do
+            echo "===== $c ====="
+            docker logs --tail 60 "$c"
+          done
